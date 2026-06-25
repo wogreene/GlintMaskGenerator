@@ -58,15 +58,16 @@ class TestBandAlignerOffsetEstimation:
     """Tests for offset estimation using phase correlation."""
 
     def test_estimate_offset_identical_bands(self):
-        """Identical bands should have zero offset."""
+        """Identical bands should have zero offset and a strong response."""
         rng = np.random.default_rng(42)
         band = rng.random((100, 100)).astype(np.float64)
-        x, y = BandAligner._estimate_offset(band, band)
-        assert x == 0
-        assert y == 0
+        x, y, response = BandAligner._estimate_offset(band, band)
+        assert abs(x) < 0.5
+        assert abs(y) < 0.5
+        assert response > 0.5
 
     def test_estimate_offset_shifted_band(self):
-        """Phase correlation should detect known shifts."""
+        """Phase correlation should detect known shifts at sub-pixel precision."""
         # Create reference band with distinct pattern
         ref = np.zeros((100, 100), dtype=np.float64)
         ref[40:60, 40:60] = 1.0  # Bright square in center
@@ -75,11 +76,11 @@ class TestBandAlignerOffsetEstimation:
         target = np.zeros((100, 100), dtype=np.float64)
         target[43:63, 45:65] = 1.0
 
-        x, y = BandAligner._estimate_offset(ref, target)
+        x, y, response = BandAligner._estimate_offset(ref, target)
         # Offset to align target TO ref is negative of the shift
-        # Allow tolerance of 1 pixel for phase correlation precision
-        assert abs(x - (-5)) <= 1
-        assert abs(y - (-3)) <= 1
+        assert abs(x - (-5)) < 1.0
+        assert abs(y - (-3)) < 1.0
+        assert response > 0.0
 
 
 class TestBandAlignerApplyOffset:

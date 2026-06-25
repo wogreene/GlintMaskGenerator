@@ -89,12 +89,29 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
                 help="Disable automatic band alignment for multi-band sensors.",
             ),
         ] = False,
+        alignment: Annotated[
+            str,
+            typer.Option(
+                "--alignment",
+                help=(
+                    "Alignment strategy: 'rig' (calibrated XMP metadata, MicaSense only), "
+                    "'phase' (content-based phase correlation), or 'default' (sensor default)."
+                ),
+            ),
+        ] = "default",
     ) -> None:
         if thresholds is None:
             thresholds = sensor_cfg.get_default_thresholds()
 
+        strategy = None if alignment == "default" else alignment
         masker = sensor_cfg.create_masker(
-            str(img_dir), str(out_dir), thresholds, pixel_buffer, per_band=per_band, align_bands=not no_align
+            str(img_dir),
+            str(out_dir),
+            thresholds,
+            pixel_buffer,
+            per_band=per_band,
+            align_bands=not no_align,
+            alignment_strategy=strategy,
         )
         _process(masker, max_workers)
 

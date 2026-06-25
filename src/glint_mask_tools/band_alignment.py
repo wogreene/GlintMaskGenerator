@@ -1,7 +1,15 @@
-"""Band alignment module for multi-band imagery using phase correlation.
+"""Band alignment module for multi-band imagery.
 
-This module provides automatic alignment of image bands from multi-sensor cameras
-where each band may have a slight spatial offset due to sensor positioning.
+Two aligner strategies live here:
+
+* :class:`BandAligner` — content-driven phase correlation. Works on any multi-band
+  sensor without sensor-specific metadata. Estimates a single translation offset
+  per band from a sample of calibration images.
+* :class:`RigCalibratedAligner` — calibrated geometric warp built from per-band
+  XMP metadata (focal length, principal point, rig rotation relatives, optional
+  lens distortion). Accurate to sub-pixel within a single camera; for multi-camera
+  rigs like MicaSense RedEdge-MX Dual, the inter-camera baseline leaves a small
+  residual that can be cleaned up by an additional phase-correlation pass.
 
 Created by: Taylor Denouden
 Organization: Hakai Institute
@@ -9,23 +17,54 @@ Organization: Hakai Institute
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from xml.etree import ElementTree as ET
 
 import cv2
 import numpy as np
+import tifffile
 from loguru import logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+    from pathlib import Path
+
+# Fraction of the sequence to keep in the middle when picking calibration samples.
+# Trims takeoff/ascent at the start and landing/descent at the end where altitude
+# and ground content aren't representative of the survey.
+_MIDDLE_FRACTION = 0.6
+
+# phaseCorrelate response below this is considered unreliable and the measurement
+# is dropped before taking the median across samples. Empirically, clean correlations
+# return >0.1 and noise floors sit around 0.01-0.03.
+_DEFAULT_MIN_RESPONSE = 0.05
+
+
+def _pick_middle_sample_indices(total: int, n: int) -> list[int]:
+    """Pick `n` indices evenly spaced across the middle ``_MIDDLE_FRACTION`` of a sequence.
+
+    Trims the first/last fraction of the sequence so takeoff/ascent and landing/descent
+    frames don't poison sample-based calibration.
+    """
+    n = min(n, total)
+    if total <= n:
+        return list(range(total))
+    margin = (1.0 - _MIDDLE_FRACTION) / 2.0
+    lo = int(round(total * margin))
+    hi = int(round(total * (1.0 - margin))) - 1
+    if hi <= lo:
+        return list(range(total))[:n]
+    return [int(round(lo + i * (hi - lo) / max(n - 1, 1))) for i in range(n)]
 
 
 @dataclass
 class BandOffsets:
-    """Calibrated offsets for each band relative to reference band (index 0)."""
+    """Calibrated offsets for each band relative to the reference band."""
 
-    x_offsets: tuple[int, ...]
-    y_offsets: tuple[int, ...]
+    x_offsets: tuple[float, ...]
+    y_offsets: tuple[float, ...]
 
     @property
     def num_bands(self) -> int:
@@ -33,8 +72,8 @@ class BandOffsets:
         return len(self.x_offsets)
 
     def has_offset(self) -> bool:
-        """Return True if any band has non-zero offset."""
-        return any(x != 0 or y != 0 for x, y in zip(self.x_offsets, self.y_offsets))
+        """Return True if any band has a non-trivial offset (>= 0.5 px in either axis)."""
+        return any(abs(x) >= 0.5 or abs(y) >= 0.5 for x, y in zip(self.x_offsets, self.y_offsets))  # noqa: PLR2004
 
 
 class BandAligner:
@@ -45,6 +84,8 @@ class BandAligner:
         calibration_samples: int = 5,
         *,
         enabled: bool = True,
+        reference_band: int = 0,
+        min_response: float = _DEFAULT_MIN_RESPONSE,
     ) -> None:
         """Create a new BandAligner.
 
@@ -54,10 +95,18 @@ class BandAligner:
             Number of images to sample for calibration (default 5).
         enabled
             Whether alignment is enabled (default True).
+        reference_band
+            Index of the band to use as the alignment reference. All other bands
+            are shifted to match this one. Default 0.
+        min_response
+            Minimum phaseCorrelate response value for a measurement to be trusted.
+            Measurements below this are dropped before taking the median.
 
         """
         self.calibration_samples = calibration_samples
         self.enabled = enabled
+        self.reference_band = reference_band
+        self.min_response = min_response
         self._offsets: BandOffsets | None = None
         self._calibrated = False
 
@@ -70,6 +119,10 @@ class BandAligner:
     def offsets(self) -> BandOffsets | None:
         """Return the calibrated offsets, or None if not calibrated."""
         return self._offsets
+
+    def _pick_sample_indices(self, total: int) -> list[int]:
+        """Pick calibration sample indices from the middle of the sequence."""
+        return _pick_middle_sample_indices(total, self.calibration_samples)
 
     def calibrate(
         self,
@@ -101,11 +154,15 @@ class BandAligner:
             self._calibrated = True
             return None
 
-        sample_paths = paths_list[: self.calibration_samples]
-        logger.info(f"Calibrating band alignment from {len(sample_paths)} sample images")
+        sample_indices = self._pick_sample_indices(len(paths_list))
+        sample_paths = [paths_list[i] for i in sample_indices]
+        logger.info(
+            f"Calibrating band alignment from {len(sample_paths)} sample images "
+            f"(indices {sample_indices} of {len(paths_list)}, reference band={self.reference_band})"
+        )
 
-        all_x_offsets: list[list[int]] = []
-        all_y_offsets: list[list[int]] = []
+        # Per-band lists of (x_offset, y_offset) measurements that passed the response check.
+        per_band_measurements: list[list[tuple[float, float]]] = []
 
         try:
             for paths in sample_paths:
@@ -118,19 +175,27 @@ class BandAligner:
                     return None
 
                 num_bands = img.shape[2]
-                ref_band = img[:, :, 0]
+                if not per_band_measurements:
+                    per_band_measurements = [[] for _ in range(num_bands)]
 
-                x_offs = [0]
-                y_offs = [0]
+                if not 0 <= self.reference_band < num_bands:
+                    msg = f"reference_band={self.reference_band} out of range for {num_bands} bands"
+                    raise ValueError(msg)
 
-                for band_idx in range(1, num_bands):
+                ref_band = img[:, :, self.reference_band]
+
+                for band_idx in range(num_bands):
+                    if band_idx == self.reference_band:
+                        per_band_measurements[band_idx].append((0.0, 0.0))
+                        continue
                     target_band = img[:, :, band_idx]
-                    x_off, y_off = self._estimate_offset(ref_band, target_band)
-                    x_offs.append(x_off)
-                    y_offs.append(y_off)
-
-                all_x_offsets.append(x_offs)
-                all_y_offsets.append(y_offs)
+                    x_off, y_off, response = self._estimate_offset(ref_band, target_band)
+                    if response < self.min_response:
+                        logger.debug(
+                            f"Dropping band {band_idx} measurement: response {response:.4f} < {self.min_response}"
+                        )
+                        continue
+                    per_band_measurements[band_idx].append((x_off, y_off))
 
         except cv2.error as e:
             logger.warning(f"Band alignment calibration failed: {e}. Alignment disabled.")
@@ -138,14 +203,29 @@ class BandAligner:
             self._calibrated = True
             return None
 
-        if all_x_offsets:
-            num_bands = len(all_x_offsets[0])
-            median_x = tuple(int(np.median([sample[i] for sample in all_x_offsets])) for i in range(num_bands))
-            median_y = tuple(int(np.median([sample[i] for sample in all_y_offsets])) for i in range(num_bands))
-            self._offsets = BandOffsets(x_offsets=median_x, y_offsets=median_y)
+        if per_band_measurements:
+            num_bands = len(per_band_measurements)
+            median_x: list[float] = []
+            median_y: list[float] = []
+            for band_idx, measurements in enumerate(per_band_measurements):
+                if not measurements:
+                    logger.warning(
+                        f"No reliable phase correlation measurements for band {band_idx}; assuming zero offset"
+                    )
+                    median_x.append(0.0)
+                    median_y.append(0.0)
+                    continue
+                xs = [m[0] for m in measurements]
+                ys = [m[1] for m in measurements]
+                median_x.append(float(np.median(xs)))
+                median_y.append(float(np.median(ys)))
+
+            self._offsets = BandOffsets(x_offsets=tuple(median_x), y_offsets=tuple(median_y))
 
             if self._offsets.has_offset():
-                logger.info(f"Band alignment offsets: x={median_x}, y={median_y}")
+                x_fmt = "(" + ", ".join(f"{v:.2f}" for v in median_x) + ")"
+                y_fmt = "(" + ", ".join(f"{v:.2f}" for v in median_y) + ")"
+                logger.info(f"Band alignment offsets: x={x_fmt}, y={y_fmt}")
             else:
                 logger.info("Band alignment calibration found no significant offsets")
 
@@ -256,30 +336,32 @@ class BandAligner:
     def _estimate_offset(
         ref_band: np.ndarray,
         target_band: np.ndarray,
-    ) -> tuple[int, int]:
-        """Estimate offset of target band relative to reference using phase correlation.
+    ) -> tuple[float, float, float]:
+        """Estimate sub-pixel offset of target band relative to reference using phase correlation.
 
         Returns
         -------
-        tuple[int, int]
-            (x_offset, y_offset) to apply to target band to align with reference.
-            This is the negated shift (correction vector).
+        tuple[float, float, float]
+            (x_offset, y_offset, response). The offsets are the sub-pixel correction
+            vector that should be applied to target_band to align it with ref_band.
+            response is phaseCorrelate's peak response value (higher = more reliable).
 
         """
-        shift, _ = cv2.phaseCorrelate(
+        shift, response = cv2.phaseCorrelate(
             ref_band.astype(np.float64),
             target_band.astype(np.float64),
         )
-        # Negate to get correction vector (shift needed to align target to ref)
-        return round(-shift[0]), round(-shift[1])
+        # Negate to get correction vector (shift needed to align target to ref).
+        # Keep sub-pixel precision — warpAffine handles fractional translations.
+        return -float(shift[0]), -float(shift[1]), float(response)
 
     @staticmethod
     def _apply_offset(
         band: np.ndarray,
-        x_offset: int,
-        y_offset: int,
+        x_offset: float,
+        y_offset: float,
     ) -> np.ndarray:
-        """Apply translation offset to a single band."""
+        """Apply translation offset to a single band (sub-pixel via bilinear interpolation)."""
         if x_offset == 0 and y_offset == 0:
             return band
 
@@ -288,6 +370,578 @@ class BandAligner:
             band.astype(np.float32),
             m,
             (band.shape[1], band.shape[0]),
+            flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         )
+
+
+# --------------------------------------------------------------------------------------
+# Rig-calibrated alignment
+# --------------------------------------------------------------------------------------
+
+# MicaSense RedEdge sensors (RedEdge-M, RedEdge-MX, RedEdge-MX Dual) all share the
+# same 1280x960 imager with a 4.8x3.6 mm active area, i.e. 3.75 µm pixel pitch.
+# Used to convert mm-valued XMP tags into pixel coordinates.
+_MICASENSE_PIXEL_PITCH_MM = 0.00375
+
+# XMP namespaces. The Pix4D Camera schema is shared by MicaSense and Parrot Sequoia.
+_XMP_NS = {
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "Camera": "http://pix4d.com/camera/1.0",
+}
+
+
+@dataclass(frozen=True)
+class BandCalibration:
+    """Per-band geometric calibration parsed from XMP metadata."""
+
+    band_idx: int
+    band_name: str
+    central_wavelength_nm: float
+    rig_camera_index: int
+    focal_length_mm: float
+    principal_point_mm: tuple[float, float]
+    rig_relatives_deg: tuple[float, float, float]
+    distortion: tuple[float, float, float, float, float] | None
+    image_size: tuple[int, int]  # (W, H)
+    pixel_pitch_mm: float = _MICASENSE_PIXEL_PITCH_MM
+
+    @property
+    def K(self) -> np.ndarray:
+        """3x3 intrinsic matrix in pixel coordinates."""
+        f_px = self.focal_length_mm / self.pixel_pitch_mm
+        cx_px = self.principal_point_mm[0] / self.pixel_pitch_mm
+        cy_px = self.principal_point_mm[1] / self.pixel_pitch_mm
+        return np.array(
+            [[f_px, 0.0, cx_px], [0.0, f_px, cy_px], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+
+
+def parse_micasense_xmp(path: str | Path, band_idx: int) -> BandCalibration:
+    """Read MicaSense (Pix4D-schema) calibration metadata from a single band TIFF.
+
+    Raises
+    ------
+    ValueError
+        If required Camera tags are missing or malformed.
+
+    """
+    with tifffile.TiffFile(str(path)) as tif:
+        page = tif.pages[0]
+        if "XMP" not in page.tags:
+            msg = f"No XMP tag in {path}"
+            raise ValueError(msg)
+        xmp = page.tags["XMP"].value
+        if isinstance(xmp, bytes):
+            xmp_str = xmp.decode("utf-8", errors="ignore")
+        else:
+            xmp_str = str(xmp)
+        h, w = page.shape[:2]
+
+    try:
+        root = ET.fromstring(xmp_str)
+    except ET.ParseError as e:
+        msg = f"Malformed XMP in {path}: {e}"
+        raise ValueError(msg) from e
+
+    # The Pix4D camera tags live in their own rdf:Description block. Identify it by
+    # the presence of Camera:BandName.
+    camera_desc = None
+    for desc in root.findall(".//rdf:Description", _XMP_NS):
+        if desc.find("Camera:BandName", _XMP_NS) is not None:
+            camera_desc = desc
+            break
+    if camera_desc is None:
+        msg = f"No Pix4D Camera description block in {path}"
+        raise ValueError(msg)
+
+    def _text(name: str, *, required: bool = True) -> str | None:
+        el = camera_desc.find(f"Camera:{name}", _XMP_NS)
+        if el is not None and el.text is not None:
+            return el.text.strip()
+        if required:
+            msg = f"missing tag Camera:{name} in {path}"
+            raise ValueError(msg)
+        return None
+
+    def _seq_floats(name: str) -> list[float] | None:
+        el = camera_desc.find(f"Camera:{name}", _XMP_NS)
+        if el is None:
+            return None
+        seq = el.find("rdf:Seq", _XMP_NS)
+        if seq is None:
+            return None
+        return [float(li.text) for li in seq.findall("rdf:li", _XMP_NS) if li.text is not None]
+
+    band_name = _text("BandName")
+    central_wavelength = float(_text("CentralWavelength"))
+    rig_camera_index = int(_text("RigCameraIndex"))
+    focal_length_mm = float(_text("PerspectiveFocalLength"))
+
+    pp_parts = [float(x) for x in _text("PrincipalPoint").split(",")]
+    if len(pp_parts) != 2:  # noqa: PLR2004
+        msg = f"PrincipalPoint malformed in {path}"
+        raise ValueError(msg)
+    principal_point_mm = (pp_parts[0], pp_parts[1])
+
+    rr_parts = [float(x) for x in _text("RigRelatives").split(",")]
+    if len(rr_parts) != 3:  # noqa: PLR2004
+        msg = f"RigRelatives malformed in {path}"
+        raise ValueError(msg)
+    rig_relatives_deg = (rr_parts[0], rr_parts[1], rr_parts[2])
+
+    dist_seq = _seq_floats("PerspectiveDistortion")
+    distortion = tuple(dist_seq) if dist_seq is not None and len(dist_seq) == 5 else None  # noqa: PLR2004
+
+    return BandCalibration(
+        band_idx=band_idx,
+        band_name=band_name,
+        central_wavelength_nm=central_wavelength,
+        rig_camera_index=rig_camera_index,
+        focal_length_mm=focal_length_mm,
+        principal_point_mm=principal_point_mm,
+        rig_relatives_deg=rig_relatives_deg,
+        distortion=distortion,
+        image_size=(w, h),
+    )
+
+
+def _euler_to_rotation_xyz(angles_deg: tuple[float, float, float]) -> np.ndarray:
+    """3x3 rotation matrix from extrinsic XYZ Euler angles (degrees).
+
+    Empirically the convention matching MicaSense's RigRelatives on RedEdge-MX Dual:
+    each band's tag is the rotation that takes vectors *from the rig body frame into
+    that band's optical frame* (so going from band B to ref needs ``R_ref^T @ R_B``).
+    """
+    a, b, c = np.deg2rad(angles_deg)
+    rx = np.array([[1, 0, 0], [0, np.cos(a), -np.sin(a)], [0, np.sin(a), np.cos(a)]])
+    ry = np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]])
+    rz = np.array([[np.cos(c), -np.sin(c), 0], [np.sin(c), np.cos(c), 0], [0, 0, 1]])
+    return rx @ ry @ rz
+
+
+class RigCalibratedAligner:
+    """Aligner using per-band XMP calibration (rig rotation + intrinsics).
+
+    Treats the scene as being at infinity, so only the rotation between bands and
+    differences in intrinsics (focal length, principal point) contribute to the
+    warp. This assumption is excellent for aerial imagery at typical survey
+    altitudes — the inter-camera baseline is ~5 cm against ~60 m altitude, giving
+    sub-pixel parallax.
+
+    The calibration is parsed once from the first capture; XMP tags are written
+    identically to every TIFF in a flight, so a single read is sufficient.
+    """
+
+    def __init__(
+        self,
+        reference_band: int = 0,
+        *,
+        enabled: bool = True,
+        parse_xmp: Callable[[str | Path, int], BandCalibration] = parse_micasense_xmp,
+        apply_distortion_correction: bool = False,
+        refine_with_phase_correlation: bool = True,
+        refinement_samples: int = 8,
+        per_image_method: str = "euclidean",
+        per_image_min_response: float = 0.08,
+        per_image_min_cc: float = 0.5,
+        ecc_max_iterations: int = 100,
+    ) -> None:
+        """Create a new RigCalibratedAligner.
+
+        Parameters
+        ----------
+        reference_band
+            Index of the band into whose frame all others are warped.
+        enabled
+            If False, behaves as a no-op (returns inputs unchanged).
+        parse_xmp
+            Callable that reads per-band metadata from a TIFF path. Defaults to
+            the MicaSense Pix4D-schema parser. Pluggable so future sensors with
+            different schemas (Altum, P4MS) can supply their own parser.
+        apply_distortion_correction
+            If True, undistort each band with its own distortion coefficients before
+            applying the rotation homography. Slightly more accurate near image
+            edges but slower; off by default since the residual is small for
+            MicaSense's near-rectilinear lenses.
+        refine_with_phase_correlation
+            If True, after building rig homographies, sample some captures from the
+            middle of the flight, warp them with the rig homography, then measure
+            the residual translation per band via phase correlation. The median
+            residual is folded into each band's homography as an additional
+            translation. This catches the dataset-average inter-camera baseline.
+        refinement_samples
+            Number of captures to sample for phase-correlation refinement.
+        per_image_method
+            Per-capture refinement strategy applied in ``align`` after rig and
+            per-flight warps. One of:
+
+            - ``"none"`` — no per-image refinement.
+            - ``"translation"`` — phase correlation, translation only. Fast but
+              cannot catch per-image rotation between Camera A and Camera B.
+            - ``"euclidean"`` (default) — ECC enhanced-correlation fit of a
+              rigid (translation + rotation) transform. Catches sub-degree
+              drone-pose rotation between the A and B exposures, which on
+              flights with active drone motion shows up as edge misalignment
+              that translation-only refinement cannot fix.
+            - ``"affine"`` — ECC with full affine (translation + rotation +
+              scale + shear). Rarely needed; for MicaSense the extra DOFs sit
+              at unity.
+
+        per_image_min_response
+            phaseCorrelate response threshold below which the per-image
+            translation correction is skipped (used only when method is
+            ``"translation"``).
+        per_image_min_cc
+            ECC correlation-coefficient threshold below which the per-image
+            ECC fit is rejected and the band falls back to rig+per-flight only.
+        ecc_max_iterations
+            Maximum ECC optimizer iterations per band per capture.
+
+        """
+        valid_methods = {"none", "translation", "euclidean", "affine"}
+        if per_image_method not in valid_methods:
+            msg = f"per_image_method must be one of {valid_methods}, got {per_image_method!r}"
+            raise ValueError(msg)
+
+        self.reference_band = reference_band
+        self.enabled = enabled
+        self._parse_xmp = parse_xmp
+        self.apply_distortion_correction = apply_distortion_correction
+        self.refine_with_phase_correlation = refine_with_phase_correlation
+        self.refinement_samples = refinement_samples
+        self.per_image_method = per_image_method
+        self.per_image_min_response = per_image_min_response
+        self.per_image_min_cc = per_image_min_cc
+        self.ecc_max_iterations = ecc_max_iterations
+
+        self._calibrated = False
+        self._calibrations: list[BandCalibration] | None = None
+        self._homographies: list[np.ndarray] | None = None
+        self._homographies_inv: list[np.ndarray] | None = None
+        self._size: tuple[int, int] | None = None  # (W, H)
+        # Per-image inverse homographies are computed in ``align`` and read by
+        # ``unalign_mask`` on the same thread; thread-local storage keeps the
+        # masker's thread pool safe.
+        self._per_image_state = threading.local()
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Return True if calibration has been performed."""
+        return self._calibrated
+
+    @property
+    def num_bands(self) -> int | None:
+        """Return the number of bands the aligner is calibrated for."""
+        return len(self._calibrations) if self._calibrations else None
+
+    def calibrate(
+        self,
+        image_paths: Iterable[list[str] | str],
+        load_fn: Callable[[list[str] | str], np.ndarray] | None = None,
+    ) -> None:
+        """Parse XMP from the first capture and compute per-band homographies.
+
+        If ``refine_with_phase_correlation`` is enabled, also sample a handful of
+        captures from the middle of the flight and measure the residual
+        translation per band after rig warping; the median residual is folded
+        into each band's homography.
+        """
+        if not self.enabled:
+            self._calibrated = True
+            return
+
+        paths_list = list(image_paths)
+        if not paths_list:
+            logger.warning("No images found for rig calibration")
+            self._calibrated = True
+            return
+
+        first = paths_list[0]
+        if isinstance(first, str):
+            msg = "RigCalibratedAligner requires per-band file paths (multi-file loader)"
+            logger.warning(msg)
+            self.enabled = False
+            self._calibrated = True
+            return
+
+        try:
+            self._calibrations = [self._parse_xmp(p, i) for i, p in enumerate(first)]
+        except (ValueError, OSError) as e:
+            logger.warning(f"Rig calibration failed: {e}. Falling back to no-op alignment.")
+            self.enabled = False
+            self._calibrated = True
+            return
+
+        if not 0 <= self.reference_band < len(self._calibrations):
+            msg = (
+                f"reference_band={self.reference_band} out of range for "
+                f"{len(self._calibrations)} bands"
+            )
+            raise ValueError(msg)
+
+        # All bands in a MicaSense capture share the same image size.
+        self._size = self._calibrations[self.reference_band].image_size
+        self._build_homographies()
+
+        if self.refine_with_phase_correlation and load_fn is not None and len(paths_list) > 1:
+            self._refine_with_phase_correlation(paths_list, load_fn)
+
+        self._calibrated = True
+
+        logger.info(
+            f"RigCalibratedAligner: {len(self._calibrations)} bands, "
+            f"reference={self.reference_band} ({self._calibrations[self.reference_band].band_name}), "
+            f"size={self._size}, refined={self.refine_with_phase_correlation}"
+        )
+
+    def _refine_with_phase_correlation(
+        self,
+        paths_list: list[list[str] | str],
+        load_fn: Callable[[list[str] | str], np.ndarray],
+    ) -> None:
+        """Measure the per-band residual translation after rig warping and fold it in."""
+        assert self._homographies is not None
+        assert self._calibrations is not None
+
+        sample_indices = _pick_middle_sample_indices(len(paths_list), self.refinement_samples)
+        per_band_shifts: list[list[tuple[float, float]]] = [[] for _ in self._calibrations]
+        try:
+            for idx in sample_indices:
+                img = load_fn(paths_list[idx])
+                # _calibrated is still False at this point — call _apply_warps directly.
+                aligned = self._apply_warps(img, self._homographies)
+                ref_band = aligned[:, :, self.reference_band].astype(np.float64)
+                for i in range(len(self._calibrations)):
+                    if i == self.reference_band:
+                        continue
+                    shift, response = cv2.phaseCorrelate(
+                        ref_band, aligned[:, :, i].astype(np.float64)
+                    )
+                    if response < _DEFAULT_MIN_RESPONSE:
+                        continue
+                    # phaseCorrelate gives the shift of target relative to ref;
+                    # we want the correction that takes target → ref.
+                    per_band_shifts[i].append((-float(shift[0]), -float(shift[1])))
+        except (cv2.error, OSError) as e:
+            logger.warning(f"Phase-correlation refinement failed: {e}. Using rig only.")
+            return
+
+        refined = []
+        refined_inv = []
+        report_x: list[float] = []
+        report_y: list[float] = []
+        for i, h in enumerate(self._homographies):
+            measurements = per_band_shifts[i]
+            if i == self.reference_band or not measurements:
+                refined.append(h)
+                refined_inv.append(np.linalg.inv(h))
+                report_x.append(0.0)
+                report_y.append(0.0)
+                continue
+            tx = float(np.median([m[0] for m in measurements]))
+            ty = float(np.median([m[1] for m in measurements]))
+            translation = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]])
+            h_final = translation @ h
+            refined.append(h_final)
+            refined_inv.append(np.linalg.inv(h_final))
+            report_x.append(tx)
+            report_y.append(ty)
+        self._homographies = refined
+        self._homographies_inv = refined_inv
+
+        x_fmt = "(" + ", ".join(f"{v:+.2f}" for v in report_x) + ")"
+        y_fmt = "(" + ", ".join(f"{v:+.2f}" for v in report_y) + ")"
+        logger.info(f"Rig refinement residual translations: x={x_fmt}, y={y_fmt}")
+
+    def _build_homographies(self) -> None:
+        assert self._calibrations is not None
+        ref = self._calibrations[self.reference_band]
+        k_ref = ref.K
+        r_ref = _euler_to_rotation_xyz(ref.rig_relatives_deg)
+
+        self._homographies = []
+        self._homographies_inv = []
+        for band in self._calibrations:
+            if band.band_idx == self.reference_band:
+                self._homographies.append(np.eye(3))
+                self._homographies_inv.append(np.eye(3))
+                continue
+            r_b = _euler_to_rotation_xyz(band.rig_relatives_deg)
+            r_rel = r_ref.T @ r_b  # band frame → ref frame
+            h = k_ref @ r_rel @ np.linalg.inv(band.K)
+            self._homographies.append(h)
+            self._homographies_inv.append(np.linalg.inv(h))
+
+    def align(self, img: np.ndarray) -> np.ndarray:
+        """Warp each band's image into the reference band's coordinate frame.
+
+        If ``per_image_method`` is not ``"none"``, also measures and corrects the
+        per-capture residual transform. The per-image inverse homographies are
+        stashed thread-locally so ``unalign_mask`` can invert them on the same
+        thread without an explicit handoff.
+        """
+        if not self.enabled or not self._calibrated or self._homographies is None:
+            self._per_image_state.inv = None
+            return img
+
+        if self.per_image_method == "none":
+            self._per_image_state.inv = None
+            return self._apply_warps(img, self._homographies)
+
+        # Per-image refinement: rig-warp first, measure the residual transform
+        # per band on the warped image, and fold it into each band's homography.
+        rig_aligned = self._apply_warps(img, self._homographies)
+        ref_band = rig_aligned[:, :, self.reference_band]
+        per_image_h: list[np.ndarray] = []
+        for i, h in enumerate(self._homographies):
+            if i == self.reference_band:
+                per_image_h.append(h)
+                continue
+            correction = self._fit_residual_transform(ref_band, rig_aligned[:, :, i])
+            per_image_h.append(h if correction is None else correction @ h)
+
+        # Re-warp with per-image homographies (single pass; we discard the
+        # intermediate rig-aligned image to keep the final interpolation in one step).
+        out = self._apply_warps(img, per_image_h)
+        self._per_image_state.inv = [np.linalg.inv(h) for h in per_image_h]
+        return out
+
+    def _fit_residual_transform(
+        self,
+        ref_band: np.ndarray,
+        target_band: np.ndarray,
+    ) -> np.ndarray | None:
+        """Estimate the residual 3x3 transform that takes ``target_band`` onto ``ref_band``.
+
+        Returns None when the fit isn't trustworthy (low ECC cc or low phase-correlation
+        response), so the caller can fall back to the rig+per-flight transform.
+        """
+        # First, phase correlation gives us a fast translation estimate. For
+        # method="translation" that's the final answer.
+        shift, response = cv2.phaseCorrelate(
+            ref_band.astype(np.float64), target_band.astype(np.float64)
+        )
+        good_translation = response >= self.per_image_min_response
+        tx, ty = (-float(shift[0]), -float(shift[1])) if good_translation else (0.0, 0.0)
+        t_matrix = np.array(
+            [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+
+        if self.per_image_method == "translation":
+            return t_matrix if good_translation else None
+
+        # ECC methods need an input image already close to the reference,
+        # otherwise the gradient descent gets stuck in the wrong basin. We
+        # *physically* pre-translate the target via warpAffine first, then run
+        # ECC from identity on the pre-translated image. Empirically: without
+        # this pre-warp ECC fails on Camera B bands that sit 5-10 px off.
+        ref32 = ref_band.astype(np.float32)
+        if good_translation:
+            t_2x3 = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float32)
+            pre_warped = cv2.warpAffine(
+                target_band.astype(np.float32),
+                t_2x3,
+                (ref32.shape[1], ref32.shape[0]),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        else:
+            pre_warped = target_band.astype(np.float32)
+
+        warp = np.eye(2, 3, dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, self.ecc_max_iterations, 1e-5)
+        motion = cv2.MOTION_EUCLIDEAN if self.per_image_method == "euclidean" else cv2.MOTION_AFFINE
+        try:
+            cc, warp = cv2.findTransformECC(ref32, pre_warped, warp, motion, criteria, None, 5)
+        except cv2.error as e:
+            logger.debug(f"ECC fit failed: {e}; using translation only")
+            return t_matrix if good_translation else None
+        if cc < self.per_image_min_cc:
+            # ECC didn't trust its own result. Fall back to translation only.
+            return t_matrix if good_translation else None
+
+        # warp maps pre_warped → ref; pre_warped = T @ target. So target → ref
+        # is the composition: (warp_3x3 @ t_matrix) applied to target.
+        warp_3x3 = self._affine_to_homography(warp)
+        return warp_3x3 @ t_matrix
+
+    @staticmethod
+    def _affine_to_homography(warp: np.ndarray) -> np.ndarray:
+        """Promote a 2x3 affine matrix to a 3x3 homography."""
+        return np.vstack([warp, np.array([0.0, 0.0, 1.0], dtype=warp.dtype)]).astype(np.float64)
+
+    def _apply_warps(self, img: np.ndarray, homographies: list[np.ndarray]) -> np.ndarray:
+        """Apply per-band homography warps to a multi-band image.
+
+        Separate from ``align`` so refinement can call it before _calibrated is True.
+        """
+        if img.shape[2] != len(homographies):
+            msg = (
+                f"Image has {img.shape[2]} bands but rig calibration is for "
+                f"{len(homographies)} bands"
+            )
+            raise ValueError(msg)
+
+        w, h = self._size
+        out = np.empty_like(img, dtype=np.float32)
+        for i, mat in enumerate(homographies):
+            if i == self.reference_band:
+                out[:, :, i] = img[:, :, i].astype(np.float32)
+                continue
+            out[:, :, i] = cv2.warpPerspective(
+                img[:, :, i].astype(np.float32),
+                mat,
+                (w, h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        return out
+
+    def unalign_mask(self, mask: np.ndarray) -> np.ndarray:
+        """Warp a union mask back into each band's original coordinate frame.
+
+        Returns a 3D mask (H, W, num_bands) regardless of input dimensionality,
+        because each band's geometric warp is distinct.
+
+        Accepts either a 2D union mask (replicated and warped per band) or a 3D
+        per-band mask (each slice warped with its own inverse homography).
+        """
+        if not self.enabled or not self._calibrated or self._homographies_inv is None:
+            return mask
+
+        # If align() ran per-image refinement on this thread, use those inverses.
+        per_image_inv = getattr(self._per_image_state, "inv", None)
+        homographies_inv = per_image_inv if per_image_inv is not None else self._homographies_inv
+
+        n_bands = len(homographies_inv)
+        w, h = self._size
+
+        if mask.ndim == 3:  # noqa: PLR2004
+            if mask.shape[2] != n_bands:
+                msg = (
+                    f"Mask has {mask.shape[2]} bands but rig calibration is for {n_bands} bands"
+                )
+                raise ValueError(msg)
+            per_band_sources = [mask[:, :, i].astype(np.float32) for i in range(n_bands)]
+        else:
+            shared = mask.astype(np.float32)
+            per_band_sources = [shared for _ in range(n_bands)]
+
+        out = np.empty((h, w, n_bands), dtype=np.float32)
+        for i, mat in enumerate(homographies_inv):
+            if i == self.reference_band:
+                out[:, :, i] = per_band_sources[i]
+                continue
+            out[:, :, i] = cv2.warpPerspective(
+                per_band_sources[i],
+                mat,
+                (w, h),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+        return out
