@@ -69,6 +69,7 @@ jobs:
           --hidden-import="gui.widgets.buffer_ctrl"
           --hidden-import="gui.widgets.threshold_ctrl"
           --hidden-import="gui.widgets.directory_path"
+          --hidden-import="gui.widgets.dual_color_progress_bar"
           src/gui/__main__.py
 
       - name: Build Linux GUI Executable
@@ -84,6 +85,7 @@ jobs:
           --hidden-import="gui.widgets.buffer_ctrl"
           --hidden-import="gui.widgets.threshold_ctrl"
           --hidden-import="gui.widgets.directory_path"
+          --hidden-import="gui.widgets.dual_color_progress_bar"
           src/gui/__main__.py
 
       - name: Archive release artifacts

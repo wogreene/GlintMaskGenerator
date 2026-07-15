@@ -99,11 +99,27 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
                 ),
             ),
         ] = "default",
+        redness_max: Annotated[
+            float,
+            typer.Option(
+                "--redness-max",
+                help=(
+                    "Enable Red-Blue chromaticity discrimination. Only pixels "
+                    "with redness (Red-Blue)/(Red+Blue) < this value are kept "
+                    "in the mask. Uses ExposureTime x ISO-normalized values, so "
+                    "spectrally-flat glint/foam is near 0 and colored benthos is "
+                    "positive. Typical value: 0.1. Set to a large negative number "
+                    "(default: -100) to disable."
+                ),
+            ),
+        ] = -100.0,
     ) -> None:
         if thresholds is None:
             thresholds = sensor_cfg.get_default_thresholds()
 
         strategy = None if alignment == "default" else alignment
+        # Sentinel: values <= -1.0 mean "disabled". Real redness thresholds are in [-1, 1].
+        redness = redness_max if redness_max > -1.0 else None
         masker = sensor_cfg.create_masker(
             str(img_dir),
             str(out_dir),
@@ -112,6 +128,7 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
             per_band=per_band,
             align_bands=not no_align,
             alignment_strategy=strategy,
+            redness_max=redness,
         )
         _process(masker, max_workers)
 

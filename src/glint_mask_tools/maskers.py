@@ -182,12 +182,14 @@ class Masker:
 
         """
         img = self.image_loader.load_image(paths)
+        band_scales = self.image_loader.read_band_scales(paths)
+        radiometric_metadata = self.image_loader.read_radiometric_metadata(paths)
 
         if self.band_aligner is not None:
             img = self.band_aligner.align(img)
 
-        img = self.image_preprocessor(img)
-        mask = self.algorithm(img)
+        img = self.image_preprocessor(img, radiometric_metadata=radiometric_metadata)
+        mask = self.algorithm(img, band_scales=band_scales)
         mask = self.postprocess_mask(mask)
 
         # Shift masks back to original unaligned coordinates for each band

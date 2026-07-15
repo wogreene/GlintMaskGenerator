@@ -61,6 +61,27 @@ class ImageLoader(ABC):
     def _(self, img_path: str) -> Iterable[str]:
         return self.get_mask_save_paths([img_path])
 
+    def read_band_scales(self, img_paths: list[str] | str) -> np.ndarray | None:  # noqa: ARG002
+        """Return per-band exposure×gain scale factors for the capture, or None.
+
+        Used by algorithms (e.g. NDVI) that need to normalize DN values across
+        bands with different auto-exposure settings. Default returns None; loaders
+        for sensors with per-band EXIF (MicaSense) override this to return the
+        actual ExposureTime × ISO per band.
+        """
+        return None
+
+    def read_radiometric_metadata(self, img_paths: list[str] | str):  # noqa: ARG002, ANN201
+        """Return per-band radiometric metadata for reflectance conversion, or None.
+
+        Returns a list of ``BandRadiometry`` instances (one per band in loader
+        order) sufficient to convert raw DN to surface reflectance via the
+        MicaSense-documented pipeline. Default returns None; MicaSense loaders
+        override this to parse the XMP + EXIF radiometric fields. Non-MicaSense
+        sensors fall back to bit-depth normalization.
+        """
+        return None
+
     def save_masks(self, mask: np.ndarray, img_paths: list[str] | str, *, per_band: bool = False) -> None:
         """Save the mask to appropriate locations based on the img_paths.
 
@@ -136,6 +157,38 @@ class MicasenseRedEdgeLoader(MultiFileImageLoader):
 
     _base_file_pattern = re.compile("(.*[\\\\/])?IMG_[0-9]{4}_1.tif", flags=re.IGNORECASE)
     _num_bands = 5
+
+    def read_band_scales(self, img_paths: list[str] | str) -> np.ndarray | None:
+        """Return per-band ExposureTime × ISOSpeed products from EXIF.
+
+        These scale factors normalize DN across bands with different auto-exposure
+        settings. A ratio-based algorithm like NDVI can divide each band's DN by
+        its scale before computing the ratio to remove the auto-exposure bias.
+        """
+        if isinstance(img_paths, str):
+            img_paths = [img_paths]
+        scales = np.empty(len(img_paths), dtype=np.float64)
+        for i, p in enumerate(img_paths):
+            with tifffile.TiffFile(p) as tif:
+                exif = tif.pages[0].tags["ExifTag"].value
+                et = exif["ExposureTime"]  # (num, denom) rational
+                exposure_s = float(et[0]) / float(et[1])
+                iso = exif.get("ISOSpeed") or exif.get("PhotographicSensitivity") or 100
+            scales[i] = exposure_s * float(iso)
+        return scales
+
+    def read_radiometric_metadata(self, img_paths: list[str] | str):  # noqa: ANN201
+        """Return per-band BandRadiometry (parses XMP + EXIF radiometric fields).
+
+        Returns None if any band's radiometric metadata is missing or malformed,
+        signalling to the sensor's preprocessor that reflectance conversion
+        isn't possible for this capture and it should fall back to bit-depth
+        normalization.
+        """
+        from .radiometric import parse_capture_radiometry  # noqa: PLC0415
+        if isinstance(img_paths, str):
+            img_paths = [img_paths]
+        return parse_capture_radiometry(img_paths)
 
     @property
     def paths(self) -> Iterable[list[str]]:

@@ -17,7 +17,6 @@ Organization: Hakai Institute
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from xml.etree import ElementTree as ET
@@ -541,12 +540,13 @@ class RigCalibratedAligner:
         enabled: bool = True,
         parse_xmp: Callable[[str | Path, int], BandCalibration] = parse_micasense_xmp,
         apply_distortion_correction: bool = False,
-        refine_with_phase_correlation: bool = True,
+        refinement_method: str = "translation",
         refinement_samples: int = 8,
-        per_image_method: str = "euclidean",
-        per_image_min_response: float = 0.08,
-        per_image_min_cc: float = 0.5,
-        ecc_max_iterations: int = 100,
+        refinement_min_response: float = 0.05,
+        refinement_min_cc: float = 0.4,
+        ecc_max_iterations: int = 50,
+        skip_ecc_below_px: float = 1.0,
+        foreign_camera_bands: list[int] | None = None,
     ) -> None:
         """Create a new RigCalibratedAligner.
 
@@ -565,66 +565,69 @@ class RigCalibratedAligner:
             applying the rotation homography. Slightly more accurate near image
             edges but slower; off by default since the residual is small for
             MicaSense's near-rectilinear lenses.
-        refine_with_phase_correlation
-            If True, after building rig homographies, sample some captures from the
-            middle of the flight, warp them with the rig homography, then measure
-            the residual translation per band via phase correlation. The median
-            residual is folded into each band's homography as an additional
-            translation. This catches the dataset-average inter-camera baseline.
+        refinement_method
+            Per-flight residual refinement, applied once during calibration and
+            baked into each band's homography. One of:
+
+            - ``"none"`` — no refinement; rig homography is applied as-is.
+            - ``"translation"`` (default) — sample N captures, phase-correlate
+              each band against the reference, take the median translation, fold
+              it in. Catches the constant inter-camera offset that the rig
+              metadata doesn't fully model.
+            - ``"affine"`` — "translation" plus a **shared** rotation applied
+              to every band on a foreign physical camera (as declared by
+              ``foreign_camera_bands``). All bands on a single PCB share the
+              same rigid rotation offset relative to the reference camera, so a
+              per-camera rotation median is more robust than fitting per-band.
+              Per-band translation still handles the DC offset. Requires
+              ``foreign_camera_bands`` to be non-empty; otherwise falls back to
+              translation-only behavior.
         refinement_samples
-            Number of captures to sample for phase-correlation refinement.
-        per_image_method
-            Per-capture refinement strategy applied in ``align`` after rig and
-            per-flight warps. One of:
-
-            - ``"none"`` — no per-image refinement.
-            - ``"translation"`` — phase correlation, translation only. Fast but
-              cannot catch per-image rotation between Camera A and Camera B.
-            - ``"euclidean"`` (default) — ECC enhanced-correlation fit of a
-              rigid (translation + rotation) transform. Catches sub-degree
-              drone-pose rotation between the A and B exposures, which on
-              flights with active drone motion shows up as edge misalignment
-              that translation-only refinement cannot fix.
-            - ``"affine"`` — ECC with full affine (translation + rotation +
-              scale + shear). Rarely needed; for MicaSense the extra DOFs sit
-              at unity.
-
-        per_image_min_response
-            phaseCorrelate response threshold below which the per-image
-            translation correction is skipped (used only when method is
-            ``"translation"``).
-        per_image_min_cc
-            ECC correlation-coefficient threshold below which the per-image
-            ECC fit is rejected and the band falls back to rig+per-flight only.
+            Number of mid-flight captures to sample for refinement fitting.
+        refinement_min_response
+            phaseCorrelate response below which a sample's translation
+            measurement is dropped before taking the per-band median.
+        refinement_min_cc
+            ECC correlation-coefficient below which a sample's ECC fit is
+            rejected before taking the per-band median.
         ecc_max_iterations
-            Maximum ECC optimizer iterations per band per capture.
+            Maximum ECC optimizer iterations per fit during calibration.
+        skip_ecc_below_px
+            If the phase-correlation translation residual is already below this
+            many pixels for a band, skip the ECC step for that sample and just
+            record the translation. On MicaSense Dual this catches the four
+            Camera A bands, where the rig homography is already sub-pixel
+            accurate. No effect if ``refinement_method`` is "none" or
+            "translation".
+        foreign_camera_bands
+            Band indices on a physical camera other than the reference band's.
+            Only these bands get the shared rotation from ``refinement_method="affine"``.
+            E.g. for MicaSense Dual with reference on Camera A: [5, 6, 7, 8, 9].
+            If None or empty, "affine" degrades to translation-only behavior.
 
         """
-        valid_methods = {"none", "translation", "euclidean", "affine"}
-        if per_image_method not in valid_methods:
-            msg = f"per_image_method must be one of {valid_methods}, got {per_image_method!r}"
+        valid_methods = {"none", "translation", "affine"}
+        if refinement_method not in valid_methods:
+            msg = f"refinement_method must be one of {valid_methods}, got {refinement_method!r}"
             raise ValueError(msg)
 
         self.reference_band = reference_band
         self.enabled = enabled
         self._parse_xmp = parse_xmp
         self.apply_distortion_correction = apply_distortion_correction
-        self.refine_with_phase_correlation = refine_with_phase_correlation
+        self.refinement_method = refinement_method
         self.refinement_samples = refinement_samples
-        self.per_image_method = per_image_method
-        self.per_image_min_response = per_image_min_response
-        self.per_image_min_cc = per_image_min_cc
+        self.refinement_min_response = refinement_min_response
+        self.refinement_min_cc = refinement_min_cc
         self.ecc_max_iterations = ecc_max_iterations
+        self.skip_ecc_below_px = skip_ecc_below_px
+        self.foreign_camera_bands = set(foreign_camera_bands) if foreign_camera_bands else set()
 
         self._calibrated = False
         self._calibrations: list[BandCalibration] | None = None
         self._homographies: list[np.ndarray] | None = None
         self._homographies_inv: list[np.ndarray] | None = None
         self._size: tuple[int, int] | None = None  # (W, H)
-        # Per-image inverse homographies are computed in ``align`` and read by
-        # ``unalign_mask`` on the same thread; thread-local storage keeps the
-        # masker's thread pool safe.
-        self._per_image_state = threading.local()
 
     @property
     def is_calibrated(self) -> bool:
@@ -643,10 +646,10 @@ class RigCalibratedAligner:
     ) -> None:
         """Parse XMP from the first capture and compute per-band homographies.
 
-        If ``refine_with_phase_correlation`` is enabled, also sample a handful of
-        captures from the middle of the flight and measure the residual
-        translation per band after rig warping; the median residual is folded
-        into each band's homography.
+        Then (if ``refinement_method`` is not "none") sample a handful of
+        mid-flight captures, fit the residual per band, take the median, and
+        fold it into each band's homography. All refinement happens here;
+        apply-time is just rig warps.
         """
         if not self.enabled:
             self._calibrated = True
@@ -685,75 +688,167 @@ class RigCalibratedAligner:
         self._size = self._calibrations[self.reference_band].image_size
         self._build_homographies()
 
-        if self.refine_with_phase_correlation and load_fn is not None and len(paths_list) > 1:
-            self._refine_with_phase_correlation(paths_list, load_fn)
+        if self.refinement_method != "none" and load_fn is not None and len(paths_list) > 1:
+            self._refine_per_flight(paths_list, load_fn)
 
         self._calibrated = True
 
         logger.info(
             f"RigCalibratedAligner: {len(self._calibrations)} bands, "
             f"reference={self.reference_band} ({self._calibrations[self.reference_band].band_name}), "
-            f"size={self._size}, refined={self.refine_with_phase_correlation}"
+            f"size={self._size}, refinement={self.refinement_method}"
         )
 
-    def _refine_with_phase_correlation(
+    def _refine_per_flight(
         self,
         paths_list: list[list[str] | str],
         load_fn: Callable[[list[str] | str], np.ndarray],
     ) -> None:
-        """Measure the per-band residual translation after rig warping and fold it in."""
+        """Sample N captures, fit the per-band residual on each, fold the median in.
+
+        For ``refinement_method="translation"`` we fit phase-correlation shifts;
+        for "affine" we fit ECC EUCLIDEAN (rotation + translation). The result is
+        a single fixed correction per band, applied to every capture.
+        """
         assert self._homographies is not None
         assert self._calibrations is not None
 
         sample_indices = _pick_middle_sample_indices(len(paths_list), self.refinement_samples)
-        per_band_shifts: list[list[tuple[float, float]]] = [[] for _ in self._calibrations]
+        # Store per-sample (theta, tx, ty). For translation-only, theta is always 0.
+        per_band_fits: list[list[tuple[float, float, float]]] = [[] for _ in self._calibrations]
+
         try:
             for idx in sample_indices:
                 img = load_fn(paths_list[idx])
-                # _calibrated is still False at this point — call _apply_warps directly.
                 aligned = self._apply_warps(img, self._homographies)
-                ref_band = aligned[:, :, self.reference_band].astype(np.float64)
+                ref_band = aligned[:, :, self.reference_band]
                 for i in range(len(self._calibrations)):
                     if i == self.reference_band:
                         continue
-                    shift, response = cv2.phaseCorrelate(
-                        ref_band, aligned[:, :, i].astype(np.float64)
-                    )
-                    if response < _DEFAULT_MIN_RESPONSE:
-                        continue
-                    # phaseCorrelate gives the shift of target relative to ref;
-                    # we want the correction that takes target → ref.
-                    per_band_shifts[i].append((-float(shift[0]), -float(shift[1])))
+                    fit = self._fit_sample(ref_band, aligned[:, :, i])
+                    if fit is not None:
+                        per_band_fits[i].append(fit)
         except (cv2.error, OSError) as e:
-            logger.warning(f"Phase-correlation refinement failed: {e}. Using rig only.")
+            logger.warning(f"Per-flight refinement failed: {e}. Using rig only.")
             return
 
-        refined = []
-        refined_inv = []
-        report_x: list[float] = []
-        report_y: list[float] = []
+        # Shared rotation across all foreign-camera bands. Pooling ECC theta fits
+        # across every foreign band and every sample gives a robust estimate of
+        # the fixed rotational offset between the two physical camera PCBs. Only
+        # samples where ECC actually ran (non-zero theta) contribute — the ones
+        # that hit the skip_ecc_below_px fast path carry no rotation signal.
+        #
+        # Sign note: ECC's returned warp W maps pre_warped → ref. When we
+        # decompose W into rotation-about-origin theta + translation, then
+        # rebuild it as a rotation-about-image-center transform applied to the
+        # raw target, the sign of the rotation must be *negated*. Composing with
+        # ECC's own theta rotates in the same direction as the existing rig
+        # misalignment (making it worse); we need the opposite direction to
+        # undo it. Verified empirically via tile-based residual measurement.
+        shared_theta = 0.0
+        if self.refinement_method == "affine" and self.foreign_camera_bands:
+            pool = [
+                f[0]
+                for i, fits in enumerate(per_band_fits)
+                if i in self.foreign_camera_bands
+                for f in fits
+                if abs(f[0]) > 1e-6
+            ]
+            if pool:
+                shared_theta = -float(np.median(pool))
+                logger.info(
+                    f"Shared foreign-camera rotation: theta={np.degrees(shared_theta):+.3f}deg "
+                    f"(from {len(pool)} ECC fits across bands {sorted(self.foreign_camera_bands)})"
+                )
+
+        cx = self._size[0] * 0.5
+        cy = self._size[1] * 0.5
+        refined: list[np.ndarray] = []
+        refined_inv: list[np.ndarray] = []
+        report: list[str] = []
         for i, h in enumerate(self._homographies):
-            measurements = per_band_shifts[i]
-            if i == self.reference_band or not measurements:
+            fits = per_band_fits[i]
+            if i == self.reference_band or not fits:
                 refined.append(h)
                 refined_inv.append(np.linalg.inv(h))
-                report_x.append(0.0)
-                report_y.append(0.0)
+                report.append("(ref)" if i == self.reference_band else "(no fit)")
                 continue
-            tx = float(np.median([m[0] for m in measurements]))
-            ty = float(np.median([m[1] for m in measurements]))
-            translation = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]])
-            h_final = translation @ h
+            median_tx = float(np.median([f[1] for f in fits]))
+            median_ty = float(np.median([f[2] for f in fits]))
+            # Only foreign-camera bands get the shared rotation; ref-camera bands
+            # get translation only (rig calibration already aligns their rotation).
+            theta = shared_theta if i in self.foreign_camera_bands else 0.0
+            c, s = np.cos(theta), np.sin(theta)
+            correction = np.array(
+                [
+                    [c, -s, cx * (1 - c) + cy * s + median_tx],
+                    [s, c, -cx * s + cy * (1 - c) + median_ty],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float64,
+            )
+            h_final = correction @ h
             refined.append(h_final)
             refined_inv.append(np.linalg.inv(h_final))
-            report_x.append(tx)
-            report_y.append(ty)
+            report.append(f"({np.degrees(theta):+.2f}deg, {median_tx:+.1f}, {median_ty:+.1f})")
         self._homographies = refined
         self._homographies_inv = refined_inv
 
-        x_fmt = "(" + ", ".join(f"{v:+.2f}" for v in report_x) + ")"
-        y_fmt = "(" + ", ".join(f"{v:+.2f}" for v in report_y) + ")"
-        logger.info(f"Rig refinement residual translations: x={x_fmt}, y={y_fmt}")
+        logger.info(f"Per-flight refinement (theta,tx,ty) per band: {', '.join(report)}")
+
+    def _fit_sample(
+        self,
+        ref_band: np.ndarray,
+        target_band: np.ndarray,
+    ) -> tuple[float, float, float] | None:
+        """Fit a single sample capture. Returns (theta_rad, tx_px, ty_px) or None.
+
+        Phase-correlation gives a robust translation estimate. If ``refinement_method``
+        is "affine", we also run ECC to recover the rotation but *only* use ECC's
+        rotation component — its translation output covaries with any per-capture
+        alignment noise and would inflate the variance of the per-band median.
+        Keeping translation and rotation decoupled lets each dimension's median
+        converge independently.
+        """
+        shift, response = cv2.phaseCorrelate(
+            ref_band.astype(np.float64), target_band.astype(np.float64)
+        )
+        if response < self.refinement_min_response:
+            return None
+        tx, ty = -float(shift[0]), -float(shift[1])
+
+        if self.refinement_method == "translation":
+            return 0.0, tx, ty
+
+        # affine: skip ECC when phase-corr residual is already tiny (Camera A path).
+        if tx * tx + ty * ty < self.skip_ecc_below_px * self.skip_ecc_below_px:
+            return 0.0, tx, ty
+
+        ref32 = ref_band.astype(np.float32)
+        t_2x3 = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float32)
+        pre_warped = cv2.warpAffine(
+            target_band.astype(np.float32),
+            t_2x3,
+            (ref32.shape[1], ref32.shape[0]),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        warp = np.eye(2, 3, dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, self.ecc_max_iterations, 1e-5)
+        try:
+            cc, warp = cv2.findTransformECC(
+                ref32, pre_warped, warp, cv2.MOTION_EUCLIDEAN, criteria, None, 5,
+            )
+        except cv2.error:
+            return 0.0, tx, ty
+        if cc < self.refinement_min_cc:
+            return 0.0, tx, ty
+
+        # Extract only the rotation from ECC; keep translation from phase corr.
+        c, s = float(warp[0, 0]), float(warp[1, 0])
+        theta = float(np.arctan2(s, c))
+        return theta, tx, ty
 
     def _build_homographies(self) -> None:
         assert self._calibrations is not None
@@ -775,103 +870,10 @@ class RigCalibratedAligner:
             self._homographies_inv.append(np.linalg.inv(h))
 
     def align(self, img: np.ndarray) -> np.ndarray:
-        """Warp each band's image into the reference band's coordinate frame.
-
-        If ``per_image_method`` is not ``"none"``, also measures and corrects the
-        per-capture residual transform. The per-image inverse homographies are
-        stashed thread-locally so ``unalign_mask`` can invert them on the same
-        thread without an explicit handoff.
-        """
+        """Warp each band's image into the reference band's coordinate frame."""
         if not self.enabled or not self._calibrated or self._homographies is None:
-            self._per_image_state.inv = None
             return img
-
-        if self.per_image_method == "none":
-            self._per_image_state.inv = None
-            return self._apply_warps(img, self._homographies)
-
-        # Per-image refinement: rig-warp first, measure the residual transform
-        # per band on the warped image, and fold it into each band's homography.
-        rig_aligned = self._apply_warps(img, self._homographies)
-        ref_band = rig_aligned[:, :, self.reference_band]
-        per_image_h: list[np.ndarray] = []
-        for i, h in enumerate(self._homographies):
-            if i == self.reference_band:
-                per_image_h.append(h)
-                continue
-            correction = self._fit_residual_transform(ref_band, rig_aligned[:, :, i])
-            per_image_h.append(h if correction is None else correction @ h)
-
-        # Re-warp with per-image homographies (single pass; we discard the
-        # intermediate rig-aligned image to keep the final interpolation in one step).
-        out = self._apply_warps(img, per_image_h)
-        self._per_image_state.inv = [np.linalg.inv(h) for h in per_image_h]
-        return out
-
-    def _fit_residual_transform(
-        self,
-        ref_band: np.ndarray,
-        target_band: np.ndarray,
-    ) -> np.ndarray | None:
-        """Estimate the residual 3x3 transform that takes ``target_band`` onto ``ref_band``.
-
-        Returns None when the fit isn't trustworthy (low ECC cc or low phase-correlation
-        response), so the caller can fall back to the rig+per-flight transform.
-        """
-        # First, phase correlation gives us a fast translation estimate. For
-        # method="translation" that's the final answer.
-        shift, response = cv2.phaseCorrelate(
-            ref_band.astype(np.float64), target_band.astype(np.float64)
-        )
-        good_translation = response >= self.per_image_min_response
-        tx, ty = (-float(shift[0]), -float(shift[1])) if good_translation else (0.0, 0.0)
-        t_matrix = np.array(
-            [[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], dtype=np.float64
-        )
-
-        if self.per_image_method == "translation":
-            return t_matrix if good_translation else None
-
-        # ECC methods need an input image already close to the reference,
-        # otherwise the gradient descent gets stuck in the wrong basin. We
-        # *physically* pre-translate the target via warpAffine first, then run
-        # ECC from identity on the pre-translated image. Empirically: without
-        # this pre-warp ECC fails on Camera B bands that sit 5-10 px off.
-        ref32 = ref_band.astype(np.float32)
-        if good_translation:
-            t_2x3 = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float32)
-            pre_warped = cv2.warpAffine(
-                target_band.astype(np.float32),
-                t_2x3,
-                (ref32.shape[1], ref32.shape[0]),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=0,
-            )
-        else:
-            pre_warped = target_band.astype(np.float32)
-
-        warp = np.eye(2, 3, dtype=np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, self.ecc_max_iterations, 1e-5)
-        motion = cv2.MOTION_EUCLIDEAN if self.per_image_method == "euclidean" else cv2.MOTION_AFFINE
-        try:
-            cc, warp = cv2.findTransformECC(ref32, pre_warped, warp, motion, criteria, None, 5)
-        except cv2.error as e:
-            logger.debug(f"ECC fit failed: {e}; using translation only")
-            return t_matrix if good_translation else None
-        if cc < self.per_image_min_cc:
-            # ECC didn't trust its own result. Fall back to translation only.
-            return t_matrix if good_translation else None
-
-        # warp maps pre_warped → ref; pre_warped = T @ target. So target → ref
-        # is the composition: (warp_3x3 @ t_matrix) applied to target.
-        warp_3x3 = self._affine_to_homography(warp)
-        return warp_3x3 @ t_matrix
-
-    @staticmethod
-    def _affine_to_homography(warp: np.ndarray) -> np.ndarray:
-        """Promote a 2x3 affine matrix to a 3x3 homography."""
-        return np.vstack([warp, np.array([0.0, 0.0, 1.0], dtype=warp.dtype)]).astype(np.float64)
+        return self._apply_warps(img, self._homographies)
 
     def _apply_warps(self, img: np.ndarray, homographies: list[np.ndarray]) -> np.ndarray:
         """Apply per-band homography warps to a multi-band image.
@@ -913,10 +915,7 @@ class RigCalibratedAligner:
         if not self.enabled or not self._calibrated or self._homographies_inv is None:
             return mask
 
-        # If align() ran per-image refinement on this thread, use those inverses.
-        per_image_inv = getattr(self._per_image_state, "inv", None)
-        homographies_inv = per_image_inv if per_image_inv is not None else self._homographies_inv
-
+        homographies_inv = self._homographies_inv
         n_bands = len(homographies_inv)
         w, h = self._size
 

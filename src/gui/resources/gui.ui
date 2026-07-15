@@ -293,6 +293,50 @@
           </property>
          </widget>
         </item>
+        <item>
+         <widget class="QWidget" name="redness_widget" native="true">
+          <layout class="QHBoxLayout" name="redness_layout">
+           <property name="leftMargin"><number>0</number></property>
+           <property name="rightMargin"><number>0</number></property>
+           <property name="topMargin"><number>0</number></property>
+           <property name="bottomMargin"><number>0</number></property>
+           <item>
+            <widget class="QCheckBox" name="redness_checkbox">
+             <property name="text">
+              <string>Reject shallow benthos (redness &gt;</string>
+             </property>
+             <property name="toolTip">
+              <string>When checked, bright pixels whose redness = (Red-Blue)/(Red+Blue) (exposure/ISO-normalized) is ABOVE this threshold are excluded from the mask (treated as colored benthos: orange/pink/yellow coral, coralline algae, etc.). Spectrally-flat glint and whitewash are kept. Requires a sensor with Red and Blue bands.</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QDoubleSpinBox" name="redness_spinbox">
+             <property name="minimum"><double>-1.000000</double></property>
+             <property name="maximum"><double>1.000000</double></property>
+             <property name="singleStep"><double>0.05</double></property>
+             <property name="decimals"><number>2</number></property>
+             <property name="value"><double>0.10</double></property>
+             <property name="toolTip">
+              <string>Redness upper bound (uses ExposureTime x ISO-normalized Red and Blue). Foam/glint reads near 0; colored benthos reads positive. Raise the threshold to be less aggressive (let more coral through as glint); lower it to reject more colored features.</string>
+             </property>
+             <property name="enabled"><bool>false</bool></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="redness_close_paren">
+             <property name="text"><string>)</string></property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="redness_spacer">
+             <property name="orientation"><enum>Qt::Horizontal</enum></property>
+             <property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property>
+            </spacer>
+           </item>
+          </layout>
+         </widget>
+        </item>
        </layout>
       </widget>
       <widget class="QWidget" name="ratio_params_widget">
@@ -381,7 +425,7 @@
      <widget class="QWidget" name="widget_14" native="true">
       <layout class="QHBoxLayout" name="horizontalLayout_10">
        <item>
-        <widget class="QProgressBar" name="progress_bar">
+        <widget class="DualColorProgressBar" name="progress_bar">
          <property name="maximum">
           <number>100</number>
          </property>
@@ -422,6 +466,11 @@
    <extends>QWidget</extends>
    <header>gui/widgets/buffer_ctrl.h</header>
    <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>DualColorProgressBar</class>
+   <extends>QProgressBar</extends>
+   <header>gui/widgets/dual_color_progress_bar.h</header>
   </customwidget>
  </customwidgets>
  <tabstops>

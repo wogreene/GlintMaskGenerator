@@ -5,6 +5,7 @@ Date: 2020-09-16.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 from PyQt6 import QtWidgets, uic
-from PyQt6.QtCore import QObject, QRunnable, Qt, QThreadPool, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QRunnable, QSettings, Qt, QThreadPool, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QIcon
 
 from glint_mask_tools import __version__
@@ -27,6 +28,12 @@ if TYPE_CHECKING:
 
 DEFAULT_PIXEL_BUFFER = 0
 DEFAULT_MAX_WORKERS = 0
+
+# QSettings organization/application name — determines the registry path on
+# Windows (HKEY_CURRENT_USER\Software\<org>\<app>) or the ini file location on
+# other platforms. Keep stable across releases so saved settings aren't lost.
+_SETTINGS_ORG = "HakaiInstitute"
+_SETTINGS_APP = "GlintMaskGenerator"
 
 
 class MessageBox(QtWidgets.QMessageBox):
@@ -66,18 +73,19 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         self.selected_sensor: Sensor | None = None
         self.threshold_widgets: list[ThresholdCtrl] = []
         self.threshold_labels: list[QtWidgets.QLabel] = []
+        # In-memory cache of per-sensor, per-band threshold values, keyed by
+        # sensor name then band name. Populated from QSettings at startup and
+        # updated whenever the user switches sensors, so edits survive both
+        # switching sensors mid-session and closing/reopening the app.
+        self._threshold_memory: dict[str, dict[str, float]] = {}
+
+        # Settings persistence (thresholds + related options survive restarts).
+        self.settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
 
         # Setup sensor dropdown
         self.setup_sensor_dropdown()
 
-        # Set default sensor and thresholds
-        if self.sensor_combo.count() > 0:
-            self.sensor_combo.setCurrentIndex(0)
-            self.on_sensor_changed()
-
-        # Set default values
-        self.pixel_buffer_w.value = DEFAULT_PIXEL_BUFFER
-        self.max_workers_spinbox.setValue(DEFAULT_MAX_WORKERS)
+        self._load_settings()
 
         self.progress_val = 0
 
@@ -88,15 +96,101 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         # Run non-ui jobs in a separate thread
         self.threadpool = QThreadPool()
 
-        # Set max workers to good default
-        self.max_workers = min(4, os.cpu_count())
-
         # Connect signals/slots
         self.run_btn.released.connect(self.run_btn_clicked)
         self.reset_thresholds_btn.released.connect(self.reset_thresholds)
         self.per_band_checkbox.stateChanged.connect(self.on_per_band_changed)
+        self.redness_checkbox.stateChanged.connect(self._on_redness_toggled)
 
         self.show()
+
+    def closeEvent(self, event) -> None:  # noqa: N802, ANN001 (Qt override)
+        """Persist settings before the window closes."""
+        self._save_settings()
+        super().closeEvent(event)
+
+    def _load_settings(self) -> None:
+        """Restore thresholds and related options saved from a previous session."""
+        thresholds_json = self.settings.value("thresholds_by_sensor", "")
+        if thresholds_json:
+            try:
+                self._threshold_memory = json.loads(thresholds_json)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Could not parse saved thresholds; using sensor defaults.")
+
+        # Restore last-selected sensor by name (robust to sensor list reordering).
+        last_sensor_name = self.settings.value("selected_sensor", "")
+        index = 0
+        if last_sensor_name:
+            for i, cfg in enumerate(_known_sensors):
+                if cfg.sensor.name == last_sensor_name:
+                    index = i
+                    break
+        if self.sensor_combo.count() > 0:
+            self.sensor_combo.setCurrentIndex(index)
+            self.on_sensor_changed()  # builds sliders; applies _threshold_memory for this sensor
+
+        self.pixel_buffer_w.value = int(self.settings.value("pixel_buffer", DEFAULT_PIXEL_BUFFER))
+        self.max_workers = int(self.settings.value("max_workers", min(4, os.cpu_count())))
+
+        per_band = self.settings.value("per_band", False, type=bool)
+        if self.per_band_checkbox.isEnabled():
+            self.per_band_checkbox.setChecked(per_band)
+
+        align_bands = self.settings.value("align_bands", True, type=bool)
+        if self.align_bands_checkbox.isEnabled():
+            self.align_bands_checkbox.setChecked(align_bands)
+
+        redness_checked = self.settings.value("redness_checked", False, type=bool)
+        if self.redness_checkbox.isEnabled():
+            self.redness_checkbox.setChecked(redness_checked)
+        self.redness_spinbox.setValue(float(self.settings.value("redness_value", self.redness_spinbox.value())))
+
+    def _save_settings(self) -> None:
+        """Persist current thresholds and related options for the next session."""
+        if self.selected_sensor is not None:
+            self._capture_thresholds_for_sensor(self.selected_sensor.name)
+        self.settings.setValue("thresholds_by_sensor", json.dumps(self._threshold_memory))
+
+        if self.selected_sensor is not None:
+            self.settings.setValue("selected_sensor", self.selected_sensor.name)
+        self.settings.setValue("pixel_buffer", self.pixel_buffer_w.value)
+        self.settings.setValue("max_workers", self.max_workers)
+        self.settings.setValue("per_band", self.per_band_checkbox.isChecked())
+        self.settings.setValue("align_bands", self.align_bands_checkbox.isChecked())
+        self.settings.setValue("redness_checked", self.redness_checkbox.isChecked())
+        self.settings.setValue("redness_value", self.redness_spinbox.value())
+
+    def _capture_thresholds_for_sensor(self, sensor_name: str) -> None:
+        """Save the current threshold widget values into the in-memory cache."""
+        if not self.selected_sensor:
+            return
+        band_values = {
+            band.name: widget.value
+            for band, widget in zip(self.selected_sensor.bands, self.threshold_widgets)
+        }
+        self._threshold_memory[sensor_name] = band_values
+
+    def _apply_remembered_thresholds(self) -> None:
+        """Apply any previously-saved threshold values for the current sensor.
+
+        Matches by band name, so it's safe even if a sensor's band list or
+        order changes between versions — any band without a remembered value
+        keeps its default.
+        """
+        if not self.selected_sensor:
+            return
+        remembered = self._threshold_memory.get(self.selected_sensor.name)
+        if not remembered:
+            return
+        for band, widget in zip(self.selected_sensor.bands, self.threshold_widgets):
+            if band.name in remembered:
+                widget.value = remembered[band.name]
+
+    def _on_redness_toggled(self, state: int) -> None:
+        """Enable/disable the redness threshold spinbox based on the checkbox."""
+        checked = state == Qt.CheckState.Checked.value
+        self.redness_spinbox.setEnabled(checked)
 
     def _apply_theme(self) -> None:
         """Apply the brutalist theme stylesheet."""
@@ -126,12 +220,18 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
 
     def on_sensor_changed(self) -> None:
         """Handle sensor selection change."""
+        # Capture the outgoing sensor's threshold values before switching away,
+        # so in-session edits survive switching sensors and back.
+        if self.selected_sensor is not None:
+            self._capture_thresholds_for_sensor(self.selected_sensor.name)
+
         # Get selected sensor from dropdown
         current_index = self.sensor_combo.currentIndex()
         if 0 <= current_index < len(_known_sensors):
             self.selected_sensor = _known_sensors[current_index].sensor
             # Update threshold sliders for the selected sensor
             self.create_threshold_sliders()
+            self._apply_remembered_thresholds()
             # Enable per-band checkbox only for multi-file sensors
             is_multi_file = issubclass(self.selected_sensor.loader_class, MultiFileImageLoader)
             self.per_band_checkbox.setEnabled(is_multi_file)
@@ -144,6 +244,16 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
                 self.align_bands_checkbox.setChecked(False)
             else:
                 self.align_bands_checkbox.setChecked(True)
+            # Enable chromaticity discriminator only for sensors that declare Red + Blue band indices
+            supports_redness = (
+                self.selected_sensor.red_band_idx is not None
+                and self.selected_sensor.blue_band_idx is not None
+            )
+            self.redness_checkbox.setEnabled(supports_redness)
+            if not supports_redness:
+                self.redness_checkbox.setChecked(False)
+            # Ensure spinbox reflects checkbox state
+            self.redness_spinbox.setEnabled(supports_redness and self.redness_checkbox.isChecked())
             # Apply per-band checkbox state to align-bands checkbox
             self.on_per_band_changed(self.per_band_checkbox.checkState().value)
 
@@ -241,6 +351,13 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         """Returns whether automatic band alignment is enabled."""
         return self.align_bands_checkbox.isChecked()
 
+    @property
+    def redness_max(self) -> float | None:
+        """Return the redness threshold if the discriminator is enabled, else None."""
+        if not self.redness_checkbox.isChecked():
+            return None
+        return float(self.redness_spinbox.value())
+
     def create_masker(self) -> Masker:
         """Returns an instance of the appropriate glint mask generator given selected options."""
         return self.selected_sensor_config.create_masker(
@@ -250,6 +367,7 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
             pixel_buffer=self.pixel_buffer_w.value,
             per_band=self.per_band_enabled,
             align_bands=self.align_bands_enabled,
+            redness_max=self.redness_max,
         )
 
     @property
@@ -283,6 +401,18 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         self.run_btn.setEnabled(False)
 
         masker = self.create_masker()
+        # Log what algorithm actually got constructed — makes it easy to catch
+        # cases where the discriminator checkbox setting didn't propagate.
+        algo_name = type(masker.algorithm).__name__
+        if hasattr(masker.algorithm, "redness_max"):
+            logger.info(
+                f"Masking with {algo_name} (redness_max={masker.algorithm.redness_max:+.3f}, "
+                f"red_band_idx={masker.algorithm.red_band_idx}, "
+                f"blue_band_idx={masker.algorithm.blue_band_idx})"
+            )
+        else:
+            logger.info(f"Masking with {algo_name} (chromaticity discriminator disabled)")
+
         self.progress_val = 0
         self.progress_maximum = len(masker)
 
