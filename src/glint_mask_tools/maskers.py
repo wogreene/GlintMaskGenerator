@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from .band_alignment import BandAligner
     from .glint_algorithms import GlintAlgorithm
     from .image_loaders import ImageLoader
+    from .irradiance import IrradianceCalibrator
 
 
 class Masker:
@@ -34,6 +35,7 @@ class Masker:
         *,
         per_band: bool = False,
         band_aligner: BandAligner | None = None,
+        irradiance_calibrator: IrradianceCalibrator | None = None,
     ) -> None:
         """Create the Masker object."""
         self.algorithm = algorithm
@@ -42,6 +44,7 @@ class Masker:
         self.pixel_buffer = pixel_buffer
         self.per_band = per_band
         self.band_aligner = band_aligner
+        self.irradiance_calibrator = irradiance_calibrator
         self.buffer_kernel = make_circular_kernel(self.pixel_buffer)
 
     # noinspection PyMethodMayBeStatic
@@ -86,6 +89,18 @@ class Masker:
             load_fn=self.image_loader.load_image,
         )
 
+    def _calibrate_irradiance(self) -> None:
+        """Build the flight-level DLS irradiance model if a calibrator is configured."""
+        if self.irradiance_calibrator is None:
+            return
+        if self.irradiance_calibrator.calibration_attempted:
+            return
+
+        self.irradiance_calibrator.calibrate(
+            capture_paths=self.image_loader.paths,
+            read_metadata_fn=self.image_loader.read_radiometric_metadata,
+        )
+
     def __call__(
         self,
         max_workers: int,
@@ -108,6 +123,7 @@ class Masker:
 
         """
         self._calibrate_alignment()
+        self._calibrate_irradiance()
 
         if max_workers == 0:
             return self.process_unthreaded(callback, err_callback)
@@ -184,6 +200,8 @@ class Masker:
         img = self.image_loader.load_image(paths)
         band_scales = self.image_loader.read_band_scales(paths)
         radiometric_metadata = self.image_loader.read_radiometric_metadata(paths)
+        if radiometric_metadata is not None and self.irradiance_calibrator is not None:
+            radiometric_metadata = self.irradiance_calibrator.apply(radiometric_metadata)
 
         if self.band_aligner is not None:
             img = self.band_aligner.align(img)

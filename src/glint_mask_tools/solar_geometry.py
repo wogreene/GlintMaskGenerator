@@ -45,6 +45,18 @@ import numpy as np
 # as a reasonable default absent a per-flight calibration measurement.
 _DEFAULT_DIRECT_TO_DIFFUSE_RATIO = 6.0
 
+# Beyond this sun-sensor angle the horizontal-irradiance model stops being
+# usable: the direct-beam term is divided by (1/ratio + cos(angle)), so as the
+# angle approaches 90° that denominator collapses toward zero (the estimate
+# explodes) and past 90° it goes negative (the sun is behind the sensor plane
+# and the DLS sees no direct beam at all). Real flights hit this whenever the
+# aircraft tilts away from a low sun. Corrections are therefore evaluated at
+# ``min(angle, MAX_RELIABLE_SUN_SENSOR_ANGLE_DEG)`` — degrading gracefully to
+# the most oblique geometry the model still handles instead of producing
+# garbage — and callers that can do better (see ``irradiance``) use this same
+# threshold to decide which frames to trust.
+MAX_RELIABLE_SUN_SENSOR_ANGLE_DEG = 75.0
+
 # DLS sensor's "up" direction in its own body frame, expressed in NED
 # (North-East-Down): the Down component is -1, i.e. the dome points away from
 # Down (up), matching MicaSense's ``dls_orientation_vector = [0, 0, -1]``.
@@ -208,7 +220,11 @@ def sun_sensor_angle(
     pitch_rad: float,
     roll_rad: float,
 ) -> float:
-    """Angle (radians) between the sun direction and the DLS sensor's pointing direction."""
+    """Angle (radians) between the sun direction and the DLS sensor's pointing direction.
+
+    0 means the DLS is pointed straight at the sun; 90° means the sun sits in
+    the sensor's plane; more than 90° means the sun is behind it.
+    """
     n_sun = sun_vector_ned(sun)
     n_sensor = sensor_orientation_ned(yaw_rad, pitch_rad, roll_rad)
     cos_angle = float(np.dot(n_sun, n_sensor))
@@ -272,8 +288,20 @@ def horizontal_irradiance(
     -------
     Irradiance corrected to a horizontal (nadir-up) sensing plane.
 
+    Notes
+    -----
+    The sun-sensor angle is clamped to ``MAX_RELIABLE_SUN_SENSOR_ANGLE_DEG``
+    before it is used. Past that point the direct-beam projection is dividing
+    by a vanishing (then negative) cosine, so an unclamped model returns wild
+    over- or under-estimates rather than degrading. Clamping bounds the
+    correction at the most oblique geometry the model still resolves; the
+    result is a floor/ceiling estimate, not a measurement, so prefer
+    ``irradiance.IrradianceCalibrator`` when other captures in the same flight
+    have usable geometry.
+
     """
-    angle = sun_sensor_angle(sun, yaw_rad, pitch_rad, roll_rad)
+    true_angle = sun_sensor_angle(sun, yaw_rad, pitch_rad, roll_rad)
+    angle = min(true_angle, math.radians(MAX_RELIABLE_SUN_SENSOR_ANGLE_DEG))
     angular_correction = dome_transmission(angle)
     if angular_correction <= 1e-6:  # noqa: PLR2004
         # Extreme incidence angle (sensor nearly edge-on to the sun); fall back
@@ -283,10 +311,8 @@ def horizontal_irradiance(
     sensor_irradiance = measured_irradiance / angular_correction
     percent_diffuse = 1.0 / direct_to_diffuse_ratio
     denom = percent_diffuse + math.cos(angle)
-    if denom <= 1e-6:  # noqa: PLR2004
-        # Sun-sensor angle near 90°+: direct component contribution is
-        # ill-conditioned. Treat as fully diffuse rather than blow up.
-        return sensor_irradiance * percent_diffuse
     untilted_direct = sensor_irradiance / denom
     scattered = untilted_direct * percent_diffuse
-    return untilted_direct * math.sin(sun.elevation_rad) + scattered
+    # Below the horizon there is no direct beam to project; only skylight remains.
+    direct_on_horizontal = untilted_direct * max(math.sin(sun.elevation_rad), 0.0)
+    return direct_on_horizontal + scattered

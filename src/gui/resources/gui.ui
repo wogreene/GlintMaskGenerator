@@ -294,6 +294,19 @@
          </widget>
         </item>
         <item>
+         <widget class="QCheckBox" name="stabilize_irradiance_checkbox">
+          <property name="text">
+           <string>Stabilize DLS irradiance across flight</string>
+          </property>
+          <property name="toolTip">
+           <string>When checked, captures whose downwelling light sensor was tilted away from the sun (common on alternating flight lines with a low sun) get their irradiance interpolated from captures in the same flight that had usable sun-sensor geometry, instead of using their own unreliable reading. Prevents whole flight lines coming out fully masked or not masked at all. MicaSense sensors only.</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QWidget" name="redness_widget" native="true">
           <layout class="QHBoxLayout" name="redness_layout">
            <property name="leftMargin"><number>0</number></property>

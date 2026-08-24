@@ -54,6 +54,12 @@ class Sensor:
     bands: list[Band]
     bit_depth: int
     loader_class: type[ImageLoader]
+    # Upper bound of the useful threshold range for this sensor, used by the GUI to
+    # scale the threshold sliders. Sensors that only bit-depth normalize their DN work
+    # on a full [0, 1] scale, so they need the whole range. Sensors converted to
+    # surface reflectance (MicaSense) live on a much smaller scale — real glint tops
+    # out near 0.08 — so a 0-1 slider would waste almost all its travel.
+    threshold_max: float = 1.0
     supports_alignment: bool = False
     # Index of the band to use as the alignment reference. Pick a band with strong texture
     # and high SNR over the expected scene content. Only used when supports_alignment=True.
@@ -103,6 +109,7 @@ class Sensor:
         align_bands: bool = True,
         alignment_strategy: str | None = None,
         redness_max: float | None = None,
+        stabilize_irradiance: bool = True,
     ) -> Masker:
         """Create a masker instance for this sensor configuration.
 
@@ -118,6 +125,12 @@ class Sensor:
             ``(Red − Blue) / (Red + Blue)`` (exposure-normalized) is below this
             bound. Rejects shallow colored benthos (coral, coralline algae)
             while preserving spectrally-flat glint and whitewash.
+        stabilize_irradiance
+            Build a flight-level DLS irradiance model and use it for captures
+            whose own sun-sensor geometry is unusable (see the ``irradiance``
+            module). Only affects sensors that convert DN to reflectance;
+            harmless no-op elsewhere. Disable to get each capture's raw
+            per-capture estimate.
 
         """
         strategy = alignment_strategy if alignment_strategy is not None else self.alignment_strategy
@@ -160,6 +173,8 @@ class Sensor:
         else:
             algorithm = ThresholdAlgorithm(thresholds, per_band=per_band)
 
+        from .irradiance import IrradianceCalibrator  # noqa: PLC0415
+
         return Masker(
             algorithm=algorithm,
             image_loader=self.loader_class(img_dir, mask_dir),
@@ -167,6 +182,7 @@ class Sensor:
             pixel_buffer=pixel_buffer,
             per_band=per_band,
             band_aligner=aligner,
+            irradiance_calibrator=IrradianceCalibrator(enabled=stabilize_irradiance),
         )
 
     def get_default_thresholds(self) -> list[float]:
@@ -230,6 +246,8 @@ msre_sensor = Sensor(
     ],
     bit_depth=16,
     loader_class=MicasenseRedEdgeLoader,
+    # Reflectance scale, not DN — see threshold_max docs on Sensor.
+    threshold_max=0.5,
     supports_alignment=True,
     # NIR (index 3) is where glint is most visible — making it the reference means the
     # mask is computed in NIR's coordinate frame, so glint detection is geometrically
@@ -265,6 +283,8 @@ msre_dual_sensor = Sensor(
     ],
     bit_depth=16,
     loader_class=MicasenseRedEdgeDualLoader,
+    # Reflectance scale, not DN — see threshold_max docs on Sensor.
+    threshold_max=0.5,
     supports_alignment=True,
     # NIR (file _4, index 3): glint is most visible there, and it's a Camera A band,
     # so other Camera A bands get sub-pixel residuals from the rig homography.

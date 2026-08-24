@@ -44,7 +44,7 @@
       <number>0</number>
      </property>
      <property name="maximum">
-      <number>500</number>
+      <number>1000</number>
      </property>
      <property name="singleStep">
       <number>1</number>
@@ -53,7 +53,7 @@
       <number>10</number>
      </property>
      <property name="toolTip">
-      <string>Surface reflectance threshold. 1.0 would be 100% reflectance (perfect Lambertian diffuser), but on real MicaSense flight data even strong glint / wave-crest specular reflectance typically tops out around 0.03-0.08 — nowhere near 1.0. Typical values: 0.02-0.03 catches broad glint + bright wave chop; 0.04-0.06 isolates stronger glint only. Tune per-flight — favorable-attitude passes read brighter than oblique/tilted passes for the same physical glint. Only applies to MicaSense sensors with full radiometric metadata; other sensors use DN normalization (0-1 range typical).</string>
+      <string>Glint threshold. Tooltip text is set at runtime to match the selected sensor's scale.</string>
      </property>
      <property name="value">
       <number>0</number>
@@ -87,7 +87,7 @@
       <double>0.000000000000000</double>
      </property>
      <property name="toolTip">
-      <string>Reflectance threshold. On real flight data, glint/wave-crest reflectance typically peaks around 0.03-0.08 (not the 1.0 = 100% you might expect) — type a value above the slider's 0-0.5 range here if needed. Higher value = more restrictive mask.</string>
+      <string>Glint threshold. Tooltip text is set at runtime to match the selected sensor's scale.</string>
      </property>
     </widget>
    </item>

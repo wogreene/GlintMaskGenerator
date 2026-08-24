@@ -113,6 +113,18 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
                 ),
             ),
         ] = -100.0,
+        no_irradiance_stabilization: Annotated[  # noqa: FBT002
+            bool,
+            typer.Option(
+                "--no-irradiance-stabilization",
+                help=(
+                    "Disable the flight-level DLS irradiance model for MicaSense sensors. "
+                    "By default, captures whose sun-sensor geometry makes their own DLS reading "
+                    "unusable (aircraft tilted away from a low sun) have their irradiance "
+                    "interpolated from captures in the same flight that do have usable geometry."
+                ),
+            ),
+        ] = False,
     ) -> None:
         if thresholds is None:
             thresholds = sensor_cfg.get_default_thresholds()
@@ -129,6 +141,7 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
             align_bands=not no_align,
             alignment_strategy=strategy,
             redness_max=redness,
+            stabilize_irradiance=not no_irradiance_stabilization,
         )
         _process(masker, max_workers)
 

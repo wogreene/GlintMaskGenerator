@@ -141,6 +141,9 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         if self.align_bands_checkbox.isEnabled():
             self.align_bands_checkbox.setChecked(align_bands)
 
+        stabilize = self.settings.value("stabilize_irradiance", defaultValue=True, type=bool)
+        self.stabilize_irradiance_checkbox.setChecked(stabilize)
+
         redness_checked = self.settings.value("redness_checked", False, type=bool)
         if self.redness_checkbox.isEnabled():
             self.redness_checkbox.setChecked(redness_checked)
@@ -158,6 +161,7 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         self.settings.setValue("max_workers", self.max_workers)
         self.settings.setValue("per_band", self.per_band_checkbox.isChecked())
         self.settings.setValue("align_bands", self.align_bands_checkbox.isChecked())
+        self.settings.setValue("stabilize_irradiance", self.stabilize_irradiance_checkbox.isChecked())
         self.settings.setValue("redness_checked", self.redness_checkbox.isChecked())
         self.settings.setValue("redness_value", self.redness_spinbox.value())
 
@@ -299,8 +303,8 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
             label = QtWidgets.QLabel(band.name)
             label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-            # Create threshold control
-            threshold_ctrl = ThresholdCtrl(self)
+            # Create threshold control, scaled to this sensor's threshold range
+            threshold_ctrl = ThresholdCtrl(self, max_value=self.selected_sensor.threshold_max)
             threshold_ctrl.value = band.default_threshold
 
             # Add to layout (row i, columns 0 and 1)
@@ -352,6 +356,11 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         return self.align_bands_checkbox.isChecked()
 
     @property
+    def stabilize_irradiance_enabled(self) -> bool:
+        """Returns whether flight-level DLS irradiance stabilization is enabled."""
+        return self.stabilize_irradiance_checkbox.isChecked()
+
+    @property
     def redness_max(self) -> float | None:
         """Return the redness threshold if the discriminator is enabled, else None."""
         if not self.redness_checkbox.isChecked():
@@ -368,6 +377,7 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
             per_band=self.per_band_enabled,
             align_bands=self.align_bands_enabled,
             redness_max=self.redness_max,
+            stabilize_irradiance=self.stabilize_irradiance_enabled,
         )
 
     @property

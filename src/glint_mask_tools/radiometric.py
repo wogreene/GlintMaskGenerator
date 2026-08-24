@@ -73,6 +73,10 @@ class BandRadiometry:
     longitude_deg: float | None
     capture_utc: datetime | None                             # None if timestamp missing
     image_size: tuple[int, int]                              # (W, H)
+    # Horizontal irradiance supplied by a flight-level model instead of this
+    # capture's own DLS geometry. Set by ``irradiance.IrradianceCalibrator``
+    # for captures whose sun-sensor angle makes their own reading unusable.
+    horizontal_irradiance_override: float | None = None
 
     @property
     def gain(self) -> float:
@@ -88,13 +92,21 @@ class BandRadiometry:
     def irradiance_horizontal_W_per_m2_per_nm(self) -> float:
         """DLS reading corrected to what a level, upward-facing sensor would read.
 
-        Uses the full sun-angle model (solar position from GPS+time, and the
-        3D angle between the sun and the DLS's actual pointing direction) when
-        yaw, GPS position, and capture time are all available. Falls back to
-        a simple overhead-sun tilt projection otherwise — adequate for small
-        tilts, but increasingly wrong as tilt grows if the sun isn't actually
-        near zenith.
+        A value supplied by a flight-level model (see
+        ``irradiance.IrradianceCalibrator``) wins over anything derivable from
+        this capture alone, because the DLS's own reading is unusable once the
+        sun passes behind its dome.
+
+        Otherwise uses the full sun-angle model (solar position from GPS+time,
+        and the 3D angle between the sun and the DLS's actual pointing
+        direction) when yaw, GPS position, and capture time are all available.
+        Falls back to a simple overhead-sun tilt projection otherwise —
+        adequate for small tilts, but increasingly wrong as tilt grows if the
+        sun isn't actually near zenith.
         """
+        if self.horizontal_irradiance_override is not None:
+            return self.horizontal_irradiance_override
+
         if (
             self.irradiance_yaw_rad is not None
             and self.latitude_deg is not None
