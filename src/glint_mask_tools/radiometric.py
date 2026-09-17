@@ -53,6 +53,11 @@ _XMP_NS = {
 
 _DEFAULT_BIT_DEPTH_MAX = 65535.0  # 2^16 − 1
 
+# Fraction of full scale above which a pixel is treated as saturated. MicaSense
+# writes 12-bit data left-shifted into 16 bits, so its real ceiling is 65520
+# rather than 65535; 0.98 catches that without flagging merely-bright pixels.
+SATURATION_DN_FRACTION = 0.98
+
 
 @dataclass(frozen=True)
 class BandRadiometry:
@@ -216,6 +221,28 @@ def dn_to_reflectance(dn: np.ndarray, meta: BandRadiometry) -> np.ndarray:
         max_l = float(np.max(l)) or 1.0
         return (l / max_l).astype(np.float32)
     return (np.pi * l / e_horizontal).astype(np.float32)
+
+
+def saturation_reflectance_ceiling(meta: BandRadiometry) -> float:
+    """Highest reflectance this capture can express: what a saturated pixel converts to.
+
+    Radiance is ``DN / (exposure * gain)``, so a clipped pixel's *converted*
+    value depends entirely on the exposure the camera happened to choose. A long
+    auto-exposure therefore pins the top of the reflectance scale low — on real
+    flights low enough that a threshold sits above it and can never trigger, no
+    matter how bright the glint actually was. Comparing a threshold against this
+    ceiling says whether the threshold is reachable at all for a capture.
+
+    Computed at the vignetting centre (V = 1); off-centre pixels have V > 1 and
+    so a slightly higher ceiling, making this the conservative estimate.
+    """
+    e_horizontal = meta.irradiance_horizontal_W_per_m2_per_nm
+    if e_horizontal <= 0:
+        return float("inf")
+    a1, _, _ = meta.radiometric_calibration
+    saturated_dn = SATURATION_DN_FRACTION * _DEFAULT_BIT_DEPTH_MAX
+    radiance = (a1 / meta.gain) * (saturated_dn - meta.black_level) / (meta.exposure_time_s * _DEFAULT_BIT_DEPTH_MAX)
+    return float(np.pi * radiance / e_horizontal)
 
 
 # ---------------------------------------------------------------------------

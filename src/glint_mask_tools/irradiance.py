@@ -43,6 +43,7 @@ import numpy as np
 from loguru import logger
 
 from . import solar_geometry
+from .radiometric import saturation_reflectance_ceiling
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -128,6 +129,7 @@ class IrradianceCalibrator:
         self.max_calibration_captures = max_calibration_captures
         self._times: np.ndarray | None = None
         self._irradiance: np.ndarray | None = None  # (n_samples, n_bands)
+        self._ceilings: np.ndarray | None = None  # (n_samples, n_bands)
         self._attempted = False
 
     @property
@@ -165,23 +167,11 @@ class IrradianceCalibrator:
         if not paths:
             return
 
-        times: list[float] = []
-        samples: list[list[float]] = []
-        n_reliable = 0
-        n_parsed = 0
-        for path in _evenly_spaced(paths, self.max_calibration_captures):
-            metadata = read_metadata_fn(path)
-            if not metadata:
-                continue
-            n_parsed += 1
-            capture_utc = metadata[0].capture_utc
-            if capture_utc is None:
-                continue
-            if not all(geometry_is_reliable(m, self.max_sun_sensor_angle_deg) for m in metadata):
-                continue
-            n_reliable += 1
-            times.append(capture_utc.timestamp())
-            samples.append([m.irradiance_horizontal_W_per_m2_per_nm for m in metadata])
+        times, samples, ceilings, n_parsed = self._sweep(paths, read_metadata_fn)
+        n_reliable = len(times)
+
+        if ceilings:
+            self._ceilings = np.asarray(ceilings)
 
         if n_parsed == 0:
             # Not MicaSense imagery, or no radiometric metadata: nothing to do.
@@ -204,6 +194,84 @@ class IrradianceCalibrator:
             f"DLS irradiance calibrated from {n_reliable}/{n_parsed} sampled captures with usable sun-sensor "
             f"geometry (<={self.max_sun_sensor_angle_deg:.0f}deg). Captures outside that will have their "
             "irradiance interpolated from this series."
+        )
+
+    def _sweep(
+        self,
+        paths: list[list[str] | str],
+        read_metadata_fn: Callable[[list[str] | str], Sequence[BandRadiometry] | None],
+    ) -> tuple[list[float], list[list[float]], list[list[float]], int]:
+        """Sample captures across the flight, returning (times, irradiance, ceilings, n_parsed).
+
+        Times and irradiance cover only the captures with usable geometry;
+        ceilings cover every capture that parsed, since threshold headroom is
+        worth reporting regardless of where the sun was.
+        """
+        times: list[float] = []
+        samples: list[list[float]] = []
+        ceilings: list[list[float]] = []
+        n_parsed = 0
+        n_unreadable = 0
+
+        for path in _evenly_spaced(paths, self.max_calibration_captures):
+            try:
+                metadata = read_metadata_fn(path)
+            except Exception as exc:
+                # A single corrupt band file shouldn't take down the whole job
+                # before any masking happens — drop the capture from the sweep
+                # and let the masking pass report it per-capture as usual.
+                n_unreadable += 1
+                logger.warning(f"Skipping {path} during irradiance calibration: {exc}")
+                continue
+            if not metadata:
+                continue
+            n_parsed += 1
+            ceilings.append([saturation_reflectance_ceiling(m) for m in metadata])
+            capture_utc = metadata[0].capture_utc
+            if capture_utc is None:
+                continue
+            if not all(geometry_is_reliable(m, self.max_sun_sensor_angle_deg) for m in metadata):
+                continue
+            times.append(capture_utc.timestamp())
+            samples.append([m.irradiance_horizontal_W_per_m2_per_nm for m in metadata])
+
+        if n_unreadable:
+            logger.warning(f"{n_unreadable} sampled capture(s) could not be read during irradiance calibration.")
+
+        return times, samples, ceilings, n_parsed
+
+    def warn_on_unreachable_thresholds(self, thresholds: Sequence[float]) -> None:
+        """Log a warning for any band whose threshold the data can't reach.
+
+        A clipped pixel converts to ``pi * L_sat / E``, and ``L_sat`` is divided
+        by exposure time, so a long auto-exposure pushes a capture's maximum
+        expressible reflectance down. When a threshold sits above that ceiling
+        no pixel can trigger it however bright the scene was, and the capture
+        yields an empty mask with nothing in the output to explain why.
+        """
+        if self._ceilings is None or not len(thresholds):
+            return
+        n_samples, n_bands = self._ceilings.shape
+        if n_bands != len(thresholds):
+            return
+
+        unreachable = self._ceilings < np.asarray(thresholds, dtype=float)
+        any_band = unreachable.any(axis=1)
+        if not any_band.any():
+            return
+
+        share = 100.0 * any_band.mean()
+        worst = [
+            f"band {b} (threshold {thresholds[b]:g}, reachable on "
+            f"{100.0 * (~unreachable[:, b]).mean():.0f}% of captures)"
+            for b in range(n_bands)
+            if unreachable[:, b].any()
+        ]
+        logger.warning(
+            f"Threshold unreachable on {share:.0f}% of {n_samples} sampled captures: the sensor saturates "
+            f"below the requested value, so those captures can only be masked via clipped pixels. "
+            f"Affected: {'; '.join(worst)}. This is an exposure limit, not a glint measurement — lower the "
+            "threshold, or fix the camera's exposure so glint stays inside the sensor's range."
         )
 
     def apply(self, metadata: Sequence[BandRadiometry]) -> list[BandRadiometry]:

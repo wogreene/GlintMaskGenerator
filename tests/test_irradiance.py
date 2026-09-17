@@ -215,6 +215,20 @@ class TestIrradianceCalibrator:
         assert not calibrator.is_calibrated
         assert calibrator.calibration_attempted
 
+    def test_unreadable_capture_is_skipped(self):
+        """A corrupt band file drops that capture instead of failing the job."""
+        captures = self._alternating_flight()
+
+        def read(k):
+            if k == 5:
+                msg = "not a TIFF file"
+                raise OSError(msg)
+            return captures[k]
+
+        calibrator = IrradianceCalibrator()
+        calibrator.calibrate(list(range(len(captures))), read)
+        assert calibrator.is_calibrated
+
     def test_empty_flight_does_not_raise(self):
         """No captures at all is a no-op."""
         calibrator = IrradianceCalibrator()

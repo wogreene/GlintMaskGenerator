@@ -36,8 +36,15 @@ class Masker:
         per_band: bool = False,
         band_aligner: BandAligner | None = None,
         irradiance_calibrator: IrradianceCalibrator | None = None,
+        saturation_dn: float | None = None,
     ) -> None:
-        """Create the Masker object."""
+        """Create the Masker object.
+
+        ``saturation_dn`` is the raw DN at which the sensor is considered
+        clipped; pixels at or above it are masked regardless of the threshold
+        (their converted value is a floor, not a measurement). Pass None to
+        disable that behaviour and mask purely on the threshold.
+        """
         self.algorithm = algorithm
         self.image_loader = image_loader
         self.image_preprocessor = image_preprocessor
@@ -45,6 +52,7 @@ class Masker:
         self.per_band = per_band
         self.band_aligner = band_aligner
         self.irradiance_calibrator = irradiance_calibrator
+        self.saturation_dn = saturation_dn
         self.buffer_kernel = make_circular_kernel(self.pixel_buffer)
 
     # noinspection PyMethodMayBeStatic
@@ -100,6 +108,12 @@ class Masker:
             capture_paths=self.image_loader.paths,
             read_metadata_fn=self.image_loader.read_radiometric_metadata,
         )
+        # Same sweep already holds the metadata needed to tell whether the
+        # thresholds are even reachable, which is worth saying out loud before
+        # a long run silently produces empty masks.
+        thresholds = getattr(self.algorithm, "thresholds", None)
+        if thresholds is not None:
+            self.irradiance_calibrator.warn_on_unreachable_thresholds(thresholds)
 
     def __call__(
         self,
@@ -206,8 +220,12 @@ class Masker:
         if self.band_aligner is not None:
             img = self.band_aligner.align(img)
 
+        # Flag clipping on the raw DN, before preprocessing folds in exposure
+        # time and irradiance and hides which pixels were actually at full well.
+        saturated = img >= self.saturation_dn if self.saturation_dn is not None else None
+
         img = self.image_preprocessor(img, radiometric_metadata=radiometric_metadata)
-        mask = self.algorithm(img, band_scales=band_scales)
+        mask = self.algorithm(img, band_scales=band_scales, saturated=saturated)
         mask = self.postprocess_mask(mask)
 
         # Shift masks back to original unaligned coordinates for each band

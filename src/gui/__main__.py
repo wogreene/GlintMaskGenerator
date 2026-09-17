@@ -101,6 +101,7 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         self.reset_thresholds_btn.released.connect(self.reset_thresholds)
         self.per_band_checkbox.stateChanged.connect(self.on_per_band_changed)
         self.redness_checkbox.stateChanged.connect(self._on_redness_toggled)
+        self.contrast_checkbox.stateChanged.connect(self._on_contrast_toggled)
 
         self.show()
 
@@ -144,6 +145,14 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         stabilize = self.settings.value("stabilize_irradiance", defaultValue=True, type=bool)
         self.stabilize_irradiance_checkbox.setChecked(stabilize)
 
+        mask_saturated = self.settings.value("mask_saturated", defaultValue=True, type=bool)
+        self.mask_saturated_checkbox.setChecked(mask_saturated)
+
+        contrast_checked = self.settings.value("contrast_checked", defaultValue=False, type=bool)
+        self.contrast_checkbox.setChecked(contrast_checked)
+        self.contrast_spinbox.setValue(float(self.settings.value("contrast_value", self.contrast_spinbox.value())))
+        self.contrast_spinbox.setEnabled(contrast_checked)
+
         redness_checked = self.settings.value("redness_checked", False, type=bool)
         if self.redness_checkbox.isEnabled():
             self.redness_checkbox.setChecked(redness_checked)
@@ -162,6 +171,9 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         self.settings.setValue("per_band", self.per_band_checkbox.isChecked())
         self.settings.setValue("align_bands", self.align_bands_checkbox.isChecked())
         self.settings.setValue("stabilize_irradiance", self.stabilize_irradiance_checkbox.isChecked())
+        self.settings.setValue("mask_saturated", self.mask_saturated_checkbox.isChecked())
+        self.settings.setValue("contrast_checked", self.contrast_checkbox.isChecked())
+        self.settings.setValue("contrast_value", self.contrast_spinbox.value())
         self.settings.setValue("redness_checked", self.redness_checkbox.isChecked())
         self.settings.setValue("redness_value", self.redness_spinbox.value())
 
@@ -190,6 +202,10 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         for band, widget in zip(self.selected_sensor.bands, self.threshold_widgets):
             if band.name in remembered:
                 widget.value = remembered[band.name]
+
+    def _on_contrast_toggled(self, state: int) -> None:
+        """Enable/disable the contrast multiplier spinbox based on the checkbox."""
+        self.contrast_spinbox.setEnabled(state == Qt.CheckState.Checked.value)
 
     def _on_redness_toggled(self, state: int) -> None:
         """Enable/disable the redness threshold spinbox based on the checkbox."""
@@ -249,10 +265,7 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
             else:
                 self.align_bands_checkbox.setChecked(True)
             # Enable chromaticity discriminator only for sensors that declare Red + Blue band indices
-            supports_redness = (
-                self.selected_sensor.red_band_idx is not None
-                and self.selected_sensor.blue_band_idx is not None
-            )
+            supports_redness = self.selected_sensor.benthos_index_bands is not None
             self.redness_checkbox.setEnabled(supports_redness)
             if not supports_redness:
                 self.redness_checkbox.setChecked(False)
@@ -361,8 +374,20 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         return self.stabilize_irradiance_checkbox.isChecked()
 
     @property
-    def redness_max(self) -> float | None:
-        """Return the redness threshold if the discriminator is enabled, else None."""
+    def mask_saturated_enabled(self) -> bool:
+        """Returns whether clipped pixels are masked regardless of threshold."""
+        return self.mask_saturated_checkbox.isChecked()
+
+    @property
+    def contrast_multiplier(self) -> float | None:
+        """Return the scene-relative contrast multiplier, or None when disabled."""
+        if not self.contrast_checkbox.isChecked():
+            return None
+        return float(self.contrast_spinbox.value())
+
+    @property
+    def benthos_index_max(self) -> float | None:
+        """Return the benthos index threshold if the discriminator is enabled, else None."""
         if not self.redness_checkbox.isChecked():
             return None
         return float(self.redness_spinbox.value())
@@ -376,8 +401,10 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
             pixel_buffer=self.pixel_buffer_w.value,
             per_band=self.per_band_enabled,
             align_bands=self.align_bands_enabled,
-            redness_max=self.redness_max,
+            benthos_index_max=self.benthos_index_max,
             stabilize_irradiance=self.stabilize_irradiance_enabled,
+            mask_saturated=self.mask_saturated_enabled,
+            contrast_multiplier=self.contrast_multiplier,
         )
 
     @property
@@ -414,14 +441,13 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         # Log what algorithm actually got constructed — makes it easy to catch
         # cases where the discriminator checkbox setting didn't propagate.
         algo_name = type(masker.algorithm).__name__
-        if hasattr(masker.algorithm, "redness_max"):
+        if hasattr(masker.algorithm, "index_max"):
             logger.info(
-                f"Masking with {algo_name} (redness_max={masker.algorithm.redness_max:+.3f}, "
-                f"red_band_idx={masker.algorithm.red_band_idx}, "
-                f"blue_band_idx={masker.algorithm.blue_band_idx})"
+                f"Masking with {algo_name} (benthos_index_max={masker.algorithm.index_max:+.3f}, "
+                f"bands={masker.algorithm.numerator_band_idx}/{masker.algorithm.denominator_band_idx})"
             )
         else:
-            logger.info(f"Masking with {algo_name} (chromaticity discriminator disabled)")
+            logger.info(f"Masking with {algo_name} (benthos discriminator disabled)")
 
         self.progress_val = 0
         self.progress_maximum = len(masker)

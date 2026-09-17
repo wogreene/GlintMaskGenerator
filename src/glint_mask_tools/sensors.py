@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .glint_algorithms import ChromaticityDiscriminatedThresholdAlgorithm, ThresholdAlgorithm
+from .glint_algorithms import SurfaceDiscriminatedThresholdAlgorithm, ThresholdAlgorithm
 from .image_loaders import (
     BigTiffLoader,
     DJIM3MLoader,
@@ -73,13 +73,17 @@ class Sensor:
     # rotation across bands on a foreign camera relative to the reference.
     # For example, MicaSense RedEdge-MX Dual has two PCBs → [0]*5 + [1]*5.
     bands_by_camera: list[int] | None = None
-    # Band indices for Red-Blue chromaticity discrimination. When both are set,
-    # callers can pass ``redness_max`` to create_masker to enable the chromaticity
-    # discriminator that rejects shallow benthos (corals with colored pigments)
-    # from the mask. Recommended: Red 668 (Camera A) + Blue 475 (Camera A) on
-    # MicaSense sensors so both bands share a physical camera (perfect alignment).
-    red_band_idx: int | None = None
-    blue_band_idx: int | None = None
+    # Band to judge scene-relative contrast in when the contrast rule is enabled.
+    # Glint is brightest and water is darkest in NIR, so NIR separates them best;
+    # sensors without a NIR band leave this None and fall back to "any band".
+    glint_reference_band: int | None = None
+    # (numerator, denominator) band indices for the water-column index that tells
+    # surface features from anything seen through water. When set, callers can
+    # pass ``benthos_index_max`` to create_masker to spare the seafloor from the
+    # mask. Pick two bands straddling water's near-infrared absorption rise —
+    # Red Edge 717 over NIR 842 on MicaSense — and keep both on the same
+    # physical camera so rig alignment registers them.
+    benthos_index_bands: tuple[int, int] | None = None
 
     def preprocess_image(
         self,
@@ -108,8 +112,10 @@ class Sensor:
         per_band: bool = False,
         align_bands: bool = True,
         alignment_strategy: str | None = None,
-        redness_max: float | None = None,
+        benthos_index_max: float | None = None,
         stabilize_irradiance: bool = True,
+        mask_saturated: bool = True,
+        contrast_multiplier: float | None = None,
     ) -> Masker:
         """Create a masker instance for this sensor configuration.
 
@@ -118,19 +124,31 @@ class Sensor:
         alignment_strategy
             Override the sensor's default alignment strategy. One of "rig", "phase",
             or "none". If None, uses ``self.alignment_strategy``.
-        redness_max
-            If set (and the sensor has ``red_band_idx`` and ``blue_band_idx``
-            configured), use the chromaticity-discriminated threshold algorithm.
-            Pixels only stay in the mask if their redness index
-            ``(Red − Blue) / (Red + Blue)`` (exposure-normalized) is below this
-            bound. Rejects shallow colored benthos (coral, coralline algae)
-            while preserving spectrally-flat glint and whitewash.
+        benthos_index_max
+            If set (and the sensor declares ``benthos_index_bands``), use the
+            surface-discriminated threshold algorithm. Pixels only stay in the
+            mask if their water-column index is below this bound, which spares
+            anything seen through water (reef, coral, sand) while keeping
+            surface glint and whitewash. Around +0.35 for the RedEdge717/NIR842
+            pair.
         stabilize_irradiance
             Build a flight-level DLS irradiance model and use it for captures
             whose own sun-sensor geometry is unusable (see the ``irradiance``
             module). Only affects sensors that convert DN to reflectance;
             harmless no-op elsewhere. Disable to get each capture's raw
             per-capture estimate.
+        mask_saturated
+            Mask pixels that hit the sensor's full well even when their
+            converted value falls below the threshold. Clipped pixels convert
+            to a floor rather than a measurement — with a long auto-exposure
+            that floor can sit below any sensible threshold — so bright glint
+            would otherwise drop out of the mask entirely.
+        contrast_multiplier
+            If set, also mask pixels exceeding this multiple of the capture's
+            own background level in ``glint_reference_band``. Unaffected by
+            exposure, gain or irradiance, so it keeps working on captures whose
+            reflectance scale is compressed by sensor clipping. Around 3 tracks
+            visible glint on MicaSense water imagery.
 
         """
         strategy = alignment_strategy if alignment_strategy is not None else self.alignment_strategy
@@ -156,22 +174,30 @@ class Sensor:
                 msg = f"Unknown alignment_strategy: {strategy!r}. Use 'rig', 'phase', or 'none'."
                 raise ValueError(msg)
 
-        if redness_max is not None and self.red_band_idx is not None and self.blue_band_idx is not None:
-            algorithm = ChromaticityDiscriminatedThresholdAlgorithm(
+        if benthos_index_max is not None and self.benthos_index_bands is not None:
+            numerator_band_idx, denominator_band_idx = self.benthos_index_bands
+            algorithm = SurfaceDiscriminatedThresholdAlgorithm(
                 thresholds,
-                red_band_idx=self.red_band_idx,
-                blue_band_idx=self.blue_band_idx,
-                redness_max=redness_max,
+                numerator_band_idx=numerator_band_idx,
+                denominator_band_idx=denominator_band_idx,
+                index_max=benthos_index_max,
                 per_band=per_band,
+                contrast_multiplier=contrast_multiplier,
+                reference_band=self.glint_reference_band,
             )
-        elif redness_max is not None:
+        elif benthos_index_max is not None:
             msg = (
-                f"Sensor {self.name!r} doesn't declare red_band_idx / blue_band_idx; "
-                "redness_max cannot be used."
+                f"Sensor {self.name!r} doesn't declare benthos_index_bands; "
+                "benthos_index_max cannot be used."
             )
             raise ValueError(msg)
         else:
-            algorithm = ThresholdAlgorithm(thresholds, per_band=per_band)
+            algorithm = ThresholdAlgorithm(
+                thresholds,
+                per_band=per_band,
+                contrast_multiplier=contrast_multiplier,
+                reference_band=self.glint_reference_band,
+            )
 
         from .irradiance import IrradianceCalibrator  # noqa: PLC0415
 
@@ -183,7 +209,15 @@ class Sensor:
             per_band=per_band,
             band_aligner=aligner,
             irradiance_calibrator=IrradianceCalibrator(enabled=stabilize_irradiance),
+            saturation_dn=self.saturation_dn if mask_saturated else None,
         )
+
+    @property
+    def saturation_dn(self) -> float:
+        """Raw DN at or above which a pixel counts as clipped for this sensor."""
+        from .radiometric import SATURATION_DN_FRACTION  # noqa: PLC0415
+
+        return SATURATION_DN_FRACTION * ((1 << self.bit_depth) - 1)
 
     def get_default_thresholds(self) -> list[float]:
         """Get the default threshold values for all bands."""
@@ -201,8 +235,10 @@ cir_sensor = Sensor(
     bands=[R, G, B, NIR],
     bit_depth=8,
     loader_class=BigTiffLoader,
-    red_band_idx=0,
-    blue_band_idx=2,
+    glint_reference_band=3,  # Near-IR
+    # Red penetrates water much further than NIR, so the same surface-vs-submerged
+    # logic applies with Red on top. Untested on this sensor's imagery.
+    benthos_index_bands=(0, 3),  # Red, Near-IR
 )
 p4ms_sensor = Sensor(
     name="DJI P4MS",
@@ -210,8 +246,10 @@ p4ms_sensor = Sensor(
     bit_depth=16,
     loader_class=P4MSLoader,
     supports_alignment=True,
-    red_band_idx=2,
-    blue_band_idx=0,
+    glint_reference_band=4,  # Near-IR
+    # Red Edge over NIR, matching the pair validated on MicaSense. Untested on
+    # P4MS reef imagery.
+    benthos_index_bands=(3, 4),  # Red Edge, Near-IR
 )
 # DJI M3M lacks a Blue band, so chromaticity discrimination isn't wired up here.
 m3m_sensor = Sensor(
@@ -220,6 +258,10 @@ m3m_sensor = Sensor(
     bit_depth=16,
     loader_class=DJIM3MLoader,
     supports_alignment=True,
+    glint_reference_band=3,  # Near-IR
+    # Red Edge over NIR, matching the pair validated on MicaSense. Untested on
+    # M3M reef imagery.
+    benthos_index_bands=(2, 3),  # Red Edge, Near-IR
 )
 # Band order below MUST match the file numbering produced by the camera, because the
 # image loader stacks files _1.._N into array indices 0..N-1. MicaSense file numbering
@@ -254,11 +296,11 @@ msre_sensor = Sensor(
     # exact for the band that matters most.
     alignment_reference_band=3,
     alignment_strategy="rig",
-    # Red 668 at index 2 (file _3) and Blue 475 at index 0 (file _1) — both on
-    # Camera A, so they're sub-pixel aligned via the rig homography. Used for
-    # the chromaticity discriminator that rejects shallow colored benthos.
-    red_band_idx=2,
-    blue_band_idx=0,
+    glint_reference_band=3,  # Near-IR 842: glint brightest, water darkest
+    # Red Edge 717 (index 4, file _5) over NIR 842 (index 3, file _4) — both on
+    # Camera A, so the rig homography registers them sub-pixel. Water absorbs
+    # 842 far harder than 717, so anything seen through water reads high.
+    benthos_index_bands=(4, 3),
 )
 
 # RedEdge-MX Dual band order from XMP BandName/CentralWavelength tags. The first 5
@@ -290,15 +332,16 @@ msre_dual_sensor = Sensor(
     # so other Camera A bands get sub-pixel residuals from the rig homography.
     alignment_reference_band=3,
     alignment_strategy="rig",
+    glint_reference_band=3,  # Near-IR 842: glint brightest, water darkest
     # First 5 files are Camera A (RedEdge-MX), last 5 are Camera B (RedEdge-MX Blue).
     # This lets the aligner fit a single shared rotation for all Camera B bands.
     bands_by_camera=[0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
-    # Red 668 at index 2 (file _3) and Blue 475 at index 0 (file _1). Both on
-    # Camera A, so they're sub-pixel aligned via the rig homography. Used by
-    # the chromaticity discriminator to distinguish spectrally-flat glint/foam
-    # (redness ≈ 0) from colored benthos (redness > 0).
-    red_band_idx=2,
-    blue_band_idx=0,
+    # Red Edge 717 (index 4, file _5) over NIR 842 (index 3, file _4), both on
+    # Camera A so the rig homography registers them sub-pixel. On Abaco reef
+    # imagery this pair kept 93% of labelled glint/whitewash while sparing 99%
+    # of labelled reef, coral and sand; a RedEdge/Red pair managed 79%/92% and
+    # the original Red/Blue pair 63%/87%.
+    benthos_index_bands=(4, 3),
 )
 
 

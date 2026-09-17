@@ -99,16 +99,16 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
                 ),
             ),
         ] = "default",
-        redness_max: Annotated[
+        benthos_index_max: Annotated[
             float,
             typer.Option(
-                "--redness-max",
+                "--benthos-index-max",
                 help=(
-                    "Enable Red-Blue chromaticity discrimination. Only pixels "
-                    "with redness (Red-Blue)/(Red+Blue) < this value are kept "
-                    "in the mask. Uses ExposureTime x ISO-normalized values, so "
-                    "spectrally-flat glint/foam is near 0 and colored benthos is "
-                    "positive. Typical value: 0.1. Set to a large negative number "
+                    "Spare the seafloor from the mask. Only pixels whose water-column index "
+                    "(RedEdge717 vs NIR842 on MicaSense) is below this value stay masked. "
+                    "Water absorbs 842nm far harder than 717nm, so anything seen through water "
+                    "reads high (reef/coral/sand around +0.6) while surface glint and foam read "
+                    "low (+0.1 to +0.2). Typical value: 0.35. Set to a large negative number "
                     "(default: -100) to disable."
                 ),
             ),
@@ -125,13 +125,38 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
                 ),
             ),
         ] = False,
+        contrast_multiplier: Annotated[
+            float,
+            typer.Option(
+                "--contrast-multiplier",
+                help=(
+                    "Also mask pixels brighter than this multiple of the capture's own background "
+                    "level in the sensor's glint reference band (NIR where there is one). Works on "
+                    "captures where sensor clipping compresses the reflectance scale and a fixed "
+                    "threshold can't be reached. Around 3 tracks visible glint on water imagery. "
+                    "Values <= 1 disable it (default)."
+                ),
+            ),
+        ] = 0.0,
+        no_mask_saturated: Annotated[  # noqa: FBT002
+            bool,
+            typer.Option(
+                "--no-mask-saturated",
+                help=(
+                    "Don't mask pixels that hit the sensor's full well. By default they are "
+                    "masked regardless of threshold: a clipped pixel's reflectance is a floor, "
+                    "not a measurement, and with a long auto-exposure that floor can fall below "
+                    "any sensible threshold, dropping real glint out of the mask."
+                ),
+            ),
+        ] = False,
     ) -> None:
         if thresholds is None:
             thresholds = sensor_cfg.get_default_thresholds()
 
         strategy = None if alignment == "default" else alignment
-        # Sentinel: values <= -1.0 mean "disabled". Real redness thresholds are in [-1, 1].
-        redness = redness_max if redness_max > -1.0 else None
+        # Sentinel: values <= -1.0 mean "disabled". Real index thresholds are in [-1, 1].
+        benthos_index = benthos_index_max if benthos_index_max > -1.0 else None
         masker = sensor_cfg.create_masker(
             str(img_dir),
             str(out_dir),
@@ -140,8 +165,11 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
             per_band=per_band,
             align_bands=not no_align,
             alignment_strategy=strategy,
-            redness_max=redness,
+            benthos_index_max=benthos_index,
             stabilize_irradiance=not no_irradiance_stabilization,
+            mask_saturated=not no_mask_saturated,
+            # A multiplier of 1 or less would flag most of the frame, so it doubles as "off".
+            contrast_multiplier=contrast_multiplier if contrast_multiplier > 1.0 else None,
         )
         _process(masker, max_workers)
 
