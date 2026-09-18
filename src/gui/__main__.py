@@ -61,6 +61,12 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         uic.loadUi(resource_path("resources/gui.ui"), self)
+        # parameters_stack sizes itself to its tallest page, and the unused
+        # ratio_params_widget page would pin the window tall enough to push the
+        # Run button off a laptop screen. Only the threshold page is ever shown.
+        ignored = QtWidgets.QSizePolicy.Policy.Ignored
+        self.ratio_params_widget.setSizePolicy(ignored, ignored)
+        self._make_options_scrollable()
 
         # Apply brutalist theme
         self._apply_theme()
@@ -102,6 +108,7 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         self.per_band_checkbox.stateChanged.connect(self.on_per_band_changed)
         self.redness_checkbox.stateChanged.connect(self._on_redness_toggled)
         self.contrast_checkbox.stateChanged.connect(self._on_contrast_toggled)
+        self.whitewash_checkbox.stateChanged.connect(self._on_whitewash_toggled)
 
         self.show()
 
@@ -152,11 +159,25 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         self.contrast_checkbox.setChecked(contrast_checked)
         self.contrast_spinbox.setValue(float(self.settings.value("contrast_value", self.contrast_spinbox.value())))
         self.contrast_spinbox.setEnabled(contrast_checked)
+        self._load_whitewash_settings()
 
         redness_checked = self.settings.value("redness_checked", False, type=bool)
         if self.redness_checkbox.isEnabled():
             self.redness_checkbox.setChecked(redness_checked)
         self.redness_spinbox.setValue(float(self.settings.value("redness_value", self.redness_spinbox.value())))
+
+    def _load_whitewash_settings(self) -> None:
+        """Restore the RGB whitewash detector's controls."""
+        for key, spinbox in (
+            ("ww_bright", self.ww_bright_spinbox),
+            ("ww_floor", self.ww_floor_spinbox),
+            ("ww_contrast", self.ww_contrast_spinbox),
+        ):
+            spinbox.setValue(float(self.settings.value(key, spinbox.value())))
+        self.spare_orange_checkbox.setChecked(self.settings.value("spare_orange", defaultValue=True, type=bool))
+        if self.whitewash_checkbox.isEnabled():
+            self.whitewash_checkbox.setChecked(self.settings.value("whitewash_checked", defaultValue=False, type=bool))
+        self._on_whitewash_toggled(self.whitewash_checkbox.checkState().value)
 
     def _save_settings(self) -> None:
         """Persist current thresholds and related options for the next session."""
@@ -173,6 +194,11 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         self.settings.setValue("stabilize_irradiance", self.stabilize_irradiance_checkbox.isChecked())
         self.settings.setValue("mask_saturated", self.mask_saturated_checkbox.isChecked())
         self.settings.setValue("contrast_checked", self.contrast_checkbox.isChecked())
+        self.settings.setValue("whitewash_checked", self.whitewash_checkbox.isChecked())
+        self.settings.setValue("ww_bright", self.ww_bright_spinbox.value())
+        self.settings.setValue("ww_floor", self.ww_floor_spinbox.value())
+        self.settings.setValue("ww_contrast", self.ww_contrast_spinbox.value())
+        self.settings.setValue("spare_orange", self.spare_orange_checkbox.isChecked())
         self.settings.setValue("contrast_value", self.contrast_spinbox.value())
         self.settings.setValue("redness_checked", self.redness_checkbox.isChecked())
         self.settings.setValue("redness_value", self.redness_spinbox.value())
@@ -202,6 +228,84 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         for band, widget in zip(self.selected_sensor.bands, self.threshold_widgets):
             if band.name in remembered:
                 widget.value = remembered[band.name]
+
+    def _on_whitewash_toggled(self, _state: int) -> None:
+        """Swap the per-band thresholds for the whitewash detector's controls."""
+        self._show_applicable_options()
+
+    def _make_options_scrollable(self) -> None:
+        """Put the options in a scroll area so the Run button never falls off-screen.
+
+        With every option visible the window is taller than a 14" laptop
+        screen; scrolling the middle keeps the paths at the top and the
+        progress bar and Run button at the bottom always in reach.
+        """
+        layout = self.centralWidget().layout()
+        index = layout.indexOf(self.parameters_stack)
+        layout.removeWidget(self.parameters_stack)
+        scroll = QtWidgets.QScrollArea(self.centralWidget())
+        scroll.setObjectName("options_scroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(self.parameters_stack)
+        layout.insertWidget(index, scroll, 1)
+        self.options_scroll = scroll
+        # The pixel buffer box is one slider; don't let it take a sixth of the window.
+        self.groupBox_12.layout().setContentsMargins(8, 2, 8, 2)
+
+    def _fit_to_screen(self) -> None:
+        """Size the window to its contents, but never taller than the screen."""
+        # Horizontal scrolling is off, so reserve room for the vertical scroll
+        # bar or it overlaps the right-hand edge of the options.
+        self.options_scroll.setMinimumWidth(
+            self.parameters_stack.minimumSizeHint().width() + self.options_scroll.verticalScrollBar().sizeHint().width()
+        )
+        natural = (
+            self.sizeHint().height()
+            - self.options_scroll.sizeHint().height()
+            + self.parameters_stack.sizeHint().height()
+        )
+        screen = self.screen() or QtWidgets.QApplication.primaryScreen()
+        # Leave room for the title bar, which isn't part of the window's height.
+        available = screen.availableGeometry().height() - 40 if screen else natural
+        self.resize(self.width(), min(natural, available))
+
+    def _show_applicable_options(self) -> None:
+        """Show only the controls that do something for the selected sensor and mode.
+
+        Keeping inapplicable rows out of the layout also keeps the window short
+        enough to fit a laptop screen.
+        """
+        sensor = self.selected_sensor
+        if sensor is None:
+            return
+        whitewash = self.whitewash_checkbox.isChecked()
+        for w in (self.ww_bright_spinbox, self.ww_floor_spinbox, self.ww_contrast_spinbox, self.spare_orange_checkbox):
+            w.setEnabled(whitewash)
+
+        self.per_band_checkbox.setVisible(issubclass(sensor.loader_class, MultiFileImageLoader))
+        self.align_bands_checkbox.setVisible(sensor.supports_alignment)
+        self.stabilize_irradiance_checkbox.setVisible(sensor.uses_dls_irradiance)
+        self.redness_widget.setVisible(sensor.benthos_index_bands is not None)
+        self.whitewash_widget.setVisible(sensor.supports_whitewash_detector)
+        self.spare_orange_widget.setVisible(sensor.supports_whitewash_detector)
+        # The whitewash detector ignores the band thresholds and the frame-contrast rule.
+        self.box_band_threshes.setVisible(not whitewash)
+        self.contrast_widget.setVisible(not whitewash)
+
+        # Shrink to fit what's left, keeping whatever width the user chose. Qt
+        # caches layout sizes until the event loop runs, so invalidate the chain
+        # from the options page up before asking for the new height.
+        for layout in (
+            self.parameters_stack.currentWidget().layout(),
+            self.parameters_stack.layout(),
+            self.centralWidget().layout(),
+            self.layout(),
+        ):
+            layout.invalidate()
+            layout.activate()
+        self._fit_to_screen()
 
     def _on_contrast_toggled(self, state: int) -> None:
         """Enable/disable the contrast multiplier spinbox based on the checkbox."""
@@ -271,6 +375,11 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
                 self.redness_checkbox.setChecked(False)
             # Ensure spinbox reflects checkbox state
             self.redness_spinbox.setEnabled(supports_redness and self.redness_checkbox.isChecked())
+            supports_whitewash = self.selected_sensor.supports_whitewash_detector
+            self.whitewash_checkbox.setEnabled(supports_whitewash)
+            if not supports_whitewash:
+                self.whitewash_checkbox.setChecked(False)
+            self._show_applicable_options()
             # Apply per-band checkbox state to align-bands checkbox
             self.on_per_band_changed(self.per_band_checkbox.checkState().value)
 
@@ -379,6 +488,18 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
         return self.mask_saturated_checkbox.isChecked()
 
     @property
+    def whitewash_params(self) -> dict | None:
+        """Return the whitewash detector settings, or None when it is off."""
+        if not self.whitewash_checkbox.isChecked():
+            return None
+        return {
+            "bright_floor": float(self.ww_bright_spinbox.value()),
+            "contrast_floor": float(self.ww_floor_spinbox.value()),
+            "local_contrast": float(self.ww_contrast_spinbox.value()),
+            "spare_orange": self.spare_orange_checkbox.isChecked(),
+        }
+
+    @property
     def contrast_multiplier(self) -> float | None:
         """Return the scene-relative contrast multiplier, or None when disabled."""
         if not self.contrast_checkbox.isChecked():
@@ -405,6 +526,7 @@ class GlintMaskGenerator(QtWidgets.QMainWindow):
             stabilize_irradiance=self.stabilize_irradiance_enabled,
             mask_saturated=self.mask_saturated_enabled,
             contrast_multiplier=self.contrast_multiplier,
+            whitewash=self.whitewash_params,
         )
 
     @property

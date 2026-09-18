@@ -212,7 +212,7 @@ def test_rgb_loader(tmp_path):
     img_path = str(tmp_path / test_files[0])
     loaded_img = image_loader.load_image(img_path)
     assert loaded_img.shape[2] == 3  # RGB channels
-    assert loaded_img.dtype == float
+    assert np.issubdtype(loaded_img.dtype, np.floating)
 
 
 def test_cir_loader(tmp_path):

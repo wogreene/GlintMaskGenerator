@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from glint_mask_tools import maskers
 from glint_mask_tools.glint_algorithms import IntensityRatioAlgorithm, ThresholdAlgorithm
 from glint_mask_tools.image_loaders import (
     DJIM3MLoader,
@@ -134,7 +135,7 @@ def test_rgb_complete_workflow(complete_sensor_suite):
     # Load and preprocess
     img = loader.load_image(img_path)
     assert img.shape[2] == 3
-    assert img.dtype == float
+    assert np.issubdtype(img.dtype, np.floating)
 
     normalized_img = masker.image_preprocessor(img)
     assert normalized_img.min() >= 0
@@ -416,7 +417,7 @@ def test_djim3m_complete_workflow(complete_sensor_suite):
 
     # Post-process mask
     processed_mask = masker.postprocess_mask(mask)
-    assert processed_mask.dtype == int  # postprocess_mask returns int when pixel_buffer > 0
+    assert processed_mask.dtype == bool  # stays boolean; int64 would cost 8x the memory on large frames
     assert processed_mask.shape == mask.shape
 
     # Convert to Metashape format
@@ -466,3 +467,34 @@ def test_djim3m_with_intensity_ratio_algorithm(complete_sensor_suite):
     processed_mask = masker.postprocess_mask(mask)
     metashape_mask = masker.to_metashape_mask(processed_mask)
     assert metashape_mask.dtype == np.uint8
+
+
+class TestMemoryLimitedWorkers:
+    """Worker count is capped so captures in flight fit in memory."""
+
+    @staticmethod
+    def _masker(tmp_path, size=(400, 300)):
+        Image.new("RGB", size).save(tmp_path / "a.png")
+        return Masker(ThresholdAlgorithm([1, 1, 1]), SingleFileImageLoader(tmp_path, tmp_path), lambda x, **_: x)
+
+    def test_caps_workers_when_memory_is_short(self, tmp_path, monkeypatch):
+        masker = self._masker(tmp_path)
+        per_capture = 400 * 300 * 3 * maskers._PEAK_BYTES_PER_SAMPLE
+        # Room for exactly three captures within the budget.
+        monkeypatch.setattr(maskers, "physical_memory_bytes", lambda: 3 * per_capture / maskers._MEMORY_BUDGET_FRACTION)
+        assert masker.memory_limited_workers(16) == 3
+
+    def test_leaves_workers_alone_when_there_is_room(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(maskers, "physical_memory_bytes", lambda: 2**40)
+        assert self._masker(tmp_path).memory_limited_workers(8) == 8
+
+    def test_never_drops_below_one_worker(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(maskers, "physical_memory_bytes", lambda: 1)
+        assert self._masker(tmp_path).memory_limited_workers(8) == 1
+
+    def test_unknown_memory_means_no_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(maskers, "physical_memory_bytes", lambda: None)
+        assert self._masker(tmp_path).memory_limited_workers(8) == 8
+
+    def test_unthreaded_is_untouched(self, tmp_path):
+        assert self._masker(tmp_path).memory_limited_workers(0) == 0

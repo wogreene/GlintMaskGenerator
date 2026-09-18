@@ -138,6 +138,33 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
                 ),
             ),
         ] = 0.0,
+        whitewash: Annotated[  # noqa: FBT002
+            bool,
+            typer.Option(
+                "--whitewash",
+                help=(
+                    "RGB only: replace the per-band thresholds with the colour + local-contrast "
+                    "whitewash detector. Masks colourless pixels that are very bright, or fairly "
+                    "bright and brighter than their surroundings; spares turquoise sand, pale reef "
+                    "flats and orange benthos."
+                ),
+            ),
+        ] = False,
+        whitewash_bright_floor: Annotated[
+            float, typer.Option(help="Whitewash detector: dimmest-channel value (0-1) masked outright.")
+        ] = 0.80,
+        whitewash_contrast_floor: Annotated[
+            float,
+            typer.Option(help="Whitewash detector: dimmest-channel value (0-1) needed before local contrast applies."),
+        ] = 0.65,
+        whitewash_local_contrast: Annotated[
+            float,
+            typer.Option(help="Whitewash detector: how many times brighter than its surroundings a pixel must be."),
+        ] = 1.35,
+        no_spare_orange: Annotated[  # noqa: FBT002
+            bool,
+            typer.Option("--no-spare-orange", help="Whitewash detector: don't exempt orange benthos."),
+        ] = False,
         no_mask_saturated: Annotated[  # noqa: FBT002
             bool,
             typer.Option(
@@ -170,6 +197,16 @@ def _create_sensor_command(sensor_cfg: Sensor) -> Callable[..., None]:
             mask_saturated=not no_mask_saturated,
             # A multiplier of 1 or less would flag most of the frame, so it doubles as "off".
             contrast_multiplier=contrast_multiplier if contrast_multiplier > 1.0 else None,
+            whitewash=(
+                {
+                    "bright_floor": whitewash_bright_floor,
+                    "contrast_floor": whitewash_contrast_floor,
+                    "local_contrast": whitewash_local_contrast,
+                    "spare_orange": not no_spare_orange,
+                }
+                if whitewash
+                else None
+            ),
         )
         _process(masker, max_workers)
 

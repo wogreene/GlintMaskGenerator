@@ -116,8 +116,9 @@ class SingleFileImageLoader(ImageLoader):
     @staticmethod
     def load_image(path: str) -> np.ndarray:
         """Load the image into a numpy array."""
-        img = np.array(Image.open(path).convert("RGB"))
-        return img.astype(float)
+        # float32 is exact for 8-bit data and halves memory: a 45 MP drone photo
+        # is 1 GB in float64 before any processing, times every worker.
+        return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
 
     @property
     def paths(self) -> Iterable[str]:
@@ -132,7 +133,7 @@ class BigTiffLoader(SingleFileImageLoader):
     def load_image(path: str) -> np.ndarray:
         """Load the image into a numpy array."""
         img = tifffile.imread(path)[:, :, :4]
-        return np.array(img).astype(float)
+        return np.asarray(img, dtype=np.float32)
 
 
 class MultiFileImageLoader(ImageLoader, metaclass=ABCMeta):

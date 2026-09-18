@@ -320,6 +320,95 @@
          </widget>
         </item>
         <item>
+         <widget class="QWidget" name="whitewash_widget" native="true">
+          <layout class="QHBoxLayout" name="whitewash_layout">
+           <property name="leftMargin"><number>0</number></property>
+           <property name="rightMargin"><number>0</number></property>
+           <property name="topMargin"><number>0</number></property>
+           <property name="bottomMargin"><number>0</number></property>
+           <item>
+            <widget class="QCheckBox" name="whitewash_checkbox">
+             <property name="text"><string>Whitewash detector: colourless and &gt;</string></property>
+             <property name="toolTip"><string>Replaces the per-band thresholds for RGB imagery. Water absorbs red, so anything seen through water is red-depleted while foam and glint come back colourless. A pixel is masked if it is colourless and either its dimmest channel is above the first value (solid whitewash), or above the second value AND the given number of times brighter than its surroundings (thinner foam and glint on reef). Uniformly bright pale reef and turquoise sand are left alone. Values are on the 0-1 image scale, so a much darker or brighter flight may need them adjusted.</string></property>
+             <property name="enabled"><bool>false</bool></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QDoubleSpinBox" name="ww_bright_spinbox">
+             <property name="maximumSize"><size><width>80</width><height>16777215</height></size></property>
+             <property name="decimals"><number>2</number></property>
+             <property name="minimum"><double>0.3</double></property>
+             <property name="maximum"><double>1.0</double></property>
+             <property name="singleStep"><double>0.05</double></property>
+             <property name="value"><double>0.8</double></property>
+             <property name="enabled"><bool>false</bool></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="ww_or_label">
+             <property name="text"><string>or</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QDoubleSpinBox" name="ww_floor_spinbox">
+             <property name="maximumSize"><size><width>80</width><height>16777215</height></size></property>
+             <property name="decimals"><number>2</number></property>
+             <property name="minimum"><double>0.2</double></property>
+             <property name="maximum"><double>1.0</double></property>
+             <property name="singleStep"><double>0.05</double></property>
+             <property name="value"><double>0.65</double></property>
+             <property name="enabled"><bool>false</bool></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="ww_and_label">
+             <property name="text"><string>and</string></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QDoubleSpinBox" name="ww_contrast_spinbox">
+             <property name="maximumSize"><size><width>80</width><height>16777215</height></size></property>
+             <property name="decimals"><number>2</number></property>
+             <property name="minimum"><double>1.0</double></property>
+             <property name="maximum"><double>5.0</double></property>
+             <property name="singleStep"><double>0.05</double></property>
+             <property name="value"><double>1.35</double></property>
+             <property name="enabled"><bool>false</bool></property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="ww_x_label">
+             <property name="text"><string>x surroundings</string></property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="whitewash_spacer">
+             <property name="orientation"><enum>Qt::Horizontal</enum></property>
+             <property name="sizeHint" stdset="0"><size><width>20</width><height>20</height></size></property>
+            </spacer>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <item>
+         <widget class="QWidget" name="spare_orange_widget" native="true">
+          <layout class="QHBoxLayout" name="spare_orange_layout">
+           <property name="leftMargin"><number>28</number></property>
+           <property name="rightMargin"><number>0</number></property>
+           <property name="topMargin"><number>0</number></property>
+           <property name="bottomMargin"><number>0</number></property>
+           <item>
+            <widget class="QCheckBox" name="spare_orange_checkbox">
+             <property name="text"><string>spare orange benthos</string></property>
+             <property name="toolTip"><string>Never mask pixels that are clearly coloured and where red beats blue, such as living Acropora palmata. Clipped foam that is only faintly warm is not affected.</string></property>
+             <property name="checked"><bool>true</bool></property>
+             <property name="enabled"><bool>false</bool></property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <item>
          <widget class="QWidget" name="contrast_widget" native="true">
           <layout class="QHBoxLayout" name="contrast_layout">
            <property name="leftMargin"><number>0</number></property>

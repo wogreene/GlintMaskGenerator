@@ -12,6 +12,8 @@ import os
 from typing import TYPE_CHECKING, Callable
 
 import numpy as np
+from loguru import logger
+from PIL import Image
 from scipy.ndimage import convolve
 
 from .utils import make_circular_kernel
@@ -21,6 +23,23 @@ if TYPE_CHECKING:
     from .glint_algorithms import GlintAlgorithm
     from .image_loaders import ImageLoader
     from .irradiance import IrradianceCalibrator
+
+
+# Peak memory per image sample (pixel x band) while one capture is being masked,
+# measured on 45 MP RGB drone photos (~1.9 GB each) and rounded up for headroom.
+_PEAK_BYTES_PER_SAMPLE = 16
+
+# Share of physical memory all workers together may use, leaving the rest for
+# the OS and whatever else is running.
+_MEMORY_BUDGET_FRACTION = 0.6
+
+
+def physical_memory_bytes() -> int | None:
+    """Total physical memory, or None where it can't be read (e.g. Windows)."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError, OSError):
+        return None
 
 
 class Masker:
@@ -62,11 +81,11 @@ class Masker:
             return mask
         if mask.ndim == 2:  # noqa: PLR2004
             # Single combined mask
-            return (convolve(mask, self.buffer_kernel, mode="constant", cval=0) > 0).astype(int)
+            return convolve(mask, self.buffer_kernel, mode="constant", cval=0) > 0
         # Per-band masks: apply buffer to each channel
-        result = np.empty_like(mask, dtype=int)
+        result = np.empty_like(mask, dtype=bool)
         for i in range(mask.shape[2]):
-            result[:, :, i] = (convolve(mask[:, :, i], self.buffer_kernel, mode="constant", cval=0) > 0).astype(int)
+            result[:, :, i] = convolve(mask[:, :, i], self.buffer_kernel, mode="constant", cval=0) > 0
         return result
 
     @staticmethod
@@ -138,10 +157,50 @@ class Masker:
         """
         self._calibrate_alignment()
         self._calibrate_irradiance()
+        max_workers = self.memory_limited_workers(max_workers)
 
         if max_workers == 0:
             return self.process_unthreaded(callback, err_callback)
         return self.process(max_workers, callback, err_callback)
+
+    def _capture_samples(self) -> int | None:
+        """Pixels x bands in one capture, read from file headers only."""
+        first = next(iter(self.image_loader.paths), None)
+        if first is None:
+            return None
+        total = 0
+        try:
+            for path in [first] if isinstance(first, str) else first:
+                with Image.open(path) as im:
+                    width, height = im.size
+                    total += width * height * len(im.getbands())
+        except Exception:
+            return None
+        return total
+
+    def memory_limited_workers(self, requested: int) -> int:
+        """Cap the worker count so all captures in flight fit in memory.
+
+        Every worker holds a full capture while it works. With 45 MP drone
+        photos that's ~1.9 GB each, so 16 workers on a 24 GB machine exhaust
+        memory before a single mask is written.
+        """
+        if requested <= 1:
+            return requested
+        memory = physical_memory_bytes()
+        samples = self._capture_samples()
+        if not memory or not samples:
+            return requested
+        per_capture = samples * _PEAK_BYTES_PER_SAMPLE
+        allowed = max(1, int(memory * _MEMORY_BUDGET_FRACTION // per_capture))
+        if allowed >= requested:
+            return requested
+        logger.warning(
+            f"Using {allowed} workers instead of {requested}: each capture needs about "
+            f"{per_capture / 2**30:.1f} GB while it's processed, and {requested} at once would exceed "
+            f"{_MEMORY_BUDGET_FRACTION:.0%} of this machine's {memory / 2**30:.0f} GB."
+        )
+        return allowed
 
     # noinspection SpellCheckingInspection
     def process_unthreaded(

@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .glint_algorithms import SurfaceDiscriminatedThresholdAlgorithm, ThresholdAlgorithm
+from .glint_algorithms import SurfaceDiscriminatedThresholdAlgorithm, ThresholdAlgorithm, WhitewashAlgorithm
 from .image_loaders import (
     BigTiffLoader,
     DJIM3MLoader,
@@ -29,6 +29,8 @@ from .utils import normalize_img
 
 if TYPE_CHECKING:
     import numpy as np
+
+    from .glint_algorithms import GlintAlgorithm
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,12 @@ class Sensor:
     # Red Edge 717 over NIR 842 on MicaSense — and keep both on the same
     # physical camera so rig alignment registers them.
     benthos_index_bands: tuple[int, int] | None = None
+    # Whether the colour + local-contrast whitewash detector applies. It reads
+    # bands as R, G, B scaled 0-1, so only plain 3-band visible imagery qualifies.
+    supports_whitewash_detector: bool = False
+    # Whether captures carry DLS irradiance and are converted to reflectance,
+    # so the flight-level irradiance model (and its GUI toggle) applies.
+    uses_dls_irradiance: bool = False
 
     def preprocess_image(
         self,
@@ -116,6 +124,7 @@ class Sensor:
         stabilize_irradiance: bool = True,
         mask_saturated: bool = True,
         contrast_multiplier: float | None = None,
+        whitewash: dict | None = None,
     ) -> Masker:
         """Create a masker instance for this sensor configuration.
 
@@ -149,6 +158,11 @@ class Sensor:
             exposure, gain or irradiance, so it keeps working on captures whose
             reflectance scale is compressed by sensor clipping. Around 3 tracks
             visible glint on MicaSense water imagery.
+        whitewash
+            If set, use the RGB whitewash detector instead of per-band
+            thresholds, with these keyword arguments for
+            ``WhitewashAlgorithm`` (``{}`` for its defaults). Only for sensors
+            with ``supports_whitewash_detector``.
 
         """
         strategy = alignment_strategy if alignment_strategy is not None else self.alignment_strategy
@@ -174,30 +188,13 @@ class Sensor:
                 msg = f"Unknown alignment_strategy: {strategy!r}. Use 'rig', 'phase', or 'none'."
                 raise ValueError(msg)
 
-        if benthos_index_max is not None and self.benthos_index_bands is not None:
-            numerator_band_idx, denominator_band_idx = self.benthos_index_bands
-            algorithm = SurfaceDiscriminatedThresholdAlgorithm(
-                thresholds,
-                numerator_band_idx=numerator_band_idx,
-                denominator_band_idx=denominator_band_idx,
-                index_max=benthos_index_max,
-                per_band=per_band,
-                contrast_multiplier=contrast_multiplier,
-                reference_band=self.glint_reference_band,
-            )
-        elif benthos_index_max is not None:
-            msg = (
-                f"Sensor {self.name!r} doesn't declare benthos_index_bands; "
-                "benthos_index_max cannot be used."
-            )
-            raise ValueError(msg)
-        else:
-            algorithm = ThresholdAlgorithm(
-                thresholds,
-                per_band=per_band,
-                contrast_multiplier=contrast_multiplier,
-                reference_band=self.glint_reference_band,
-            )
+        algorithm = self._build_algorithm(
+            thresholds,
+            per_band=per_band,
+            benthos_index_max=benthos_index_max,
+            contrast_multiplier=contrast_multiplier,
+            whitewash=whitewash,
+        )
 
         from .irradiance import IrradianceCalibrator  # noqa: PLC0415
 
@@ -210,6 +207,46 @@ class Sensor:
             band_aligner=aligner,
             irradiance_calibrator=IrradianceCalibrator(enabled=stabilize_irradiance),
             saturation_dn=self.saturation_dn if mask_saturated else None,
+        )
+
+    def _build_algorithm(
+        self,
+        thresholds: list[float],
+        *,
+        per_band: bool,
+        benthos_index_max: float | None,
+        contrast_multiplier: float | None,
+        whitewash: dict | None,
+    ) -> GlintAlgorithm:
+        """Pick the glint algorithm for the requested options."""
+        if whitewash is not None:
+            if not self.supports_whitewash_detector:
+                msg = f"Sensor {self.name!r} doesn't support the whitewash detector."
+                raise ValueError(msg)
+            return WhitewashAlgorithm(**whitewash, per_band=per_band)
+
+        if benthos_index_max is not None and self.benthos_index_bands is not None:
+            numerator_band_idx, denominator_band_idx = self.benthos_index_bands
+            return SurfaceDiscriminatedThresholdAlgorithm(
+                thresholds,
+                numerator_band_idx=numerator_band_idx,
+                denominator_band_idx=denominator_band_idx,
+                index_max=benthos_index_max,
+                per_band=per_band,
+                contrast_multiplier=contrast_multiplier,
+                reference_band=self.glint_reference_band,
+            )
+        if benthos_index_max is not None:
+            msg = (
+                f"Sensor {self.name!r} doesn't declare benthos_index_bands; "
+                "benthos_index_max cannot be used."
+            )
+            raise ValueError(msg)
+        return ThresholdAlgorithm(
+            thresholds,
+            per_band=per_band,
+            contrast_multiplier=contrast_multiplier,
+            reference_band=self.glint_reference_band,
         )
 
     @property
@@ -229,6 +266,7 @@ rgb_sensor = Sensor(
     bands=[R, G, B],
     bit_depth=8,
     loader_class=SingleFileImageLoader,
+    supports_whitewash_detector=True,
 )
 cir_sensor = Sensor(
     name="PhaseOne 4-band CIR",
@@ -288,6 +326,7 @@ msre_sensor = Sensor(
     ],
     bit_depth=16,
     loader_class=MicasenseRedEdgeLoader,
+    uses_dls_irradiance=True,
     # Reflectance scale, not DN — see threshold_max docs on Sensor.
     threshold_max=0.5,
     supports_alignment=True,
@@ -325,6 +364,7 @@ msre_dual_sensor = Sensor(
     ],
     bit_depth=16,
     loader_class=MicasenseRedEdgeDualLoader,
+    uses_dls_irradiance=True,
     # Reflectance scale, not DN — see threshold_max docs on Sensor.
     threshold_max=0.5,
     supports_alignment=True,

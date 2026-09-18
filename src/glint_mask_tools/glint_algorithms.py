@@ -12,6 +12,8 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import numpy as np
+from PIL import Image
+from scipy.ndimage import median_filter
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -384,3 +386,129 @@ class IntensityRatioAlgorithm(GlintAlgorithm):
 
         # Estimate the spectral component of each pixel
         return np.clip(i_max - (q_x_hat * i_range), 0, None)
+
+
+# The local background is estimated on a downsampled copy so the window covers
+# the same share of the frame whatever the sensor resolution: ~250 px across,
+# with a 15 px median, spans about 6% of the frame width.
+_BACKGROUND_WORKING_WIDTH = 250
+_BACKGROUND_KERNEL = 15
+
+
+def local_background(channel: np.ndarray) -> np.ndarray:
+    """Median brightness of each pixel's neighbourhood, at full resolution."""
+    h, w = channel.shape
+    step = max(1, w // _BACKGROUND_WORKING_WIDTH)
+    small = median_filter(np.ascontiguousarray(channel[::step, ::step], dtype=np.float32), size=_BACKGROUND_KERNEL)
+    return np.array(Image.fromarray(small).resize((w, h), Image.BILINEAR))
+
+
+class WhitewashAlgorithm(GlintAlgorithm):
+    """Colour and local-contrast detector for whitewash and glint in RGB imagery.
+
+    A fixed per-band threshold can't separate foam from bright shallow sand or
+    pale reef in RGB, because all of them can be bright in blue and green. What
+    differs is colour. Water absorbs red, so anything seen *through* water is
+    red-depleted, while foam and glint sit on the surface and come back
+    colourless. So a pixel is masked when it is colourless (low saturation)
+    and either:
+
+      * very bright — its dimmest channel exceeds ``bright_floor``, which is how
+        solid whitewash looks. Big foam patches are too large to stand out from
+        their own neighbourhood, so they need an absolute test; or
+      * fairly bright — dimmest channel above ``contrast_floor`` — *and* at
+        least ``local_contrast`` times brighter than its surroundings, which
+        catches thinner foam and glint lying on reef, while leaving pale reef
+        flats and shallow sand that are uniformly bright over a wide area.
+
+    Orange benthos (e.g. living *Acropora palmata*) is spared explicitly: a
+    pixel where red clearly beats blue *and* that is actually coloured is
+    never masked. The colour requirement matters — clipped foam is often a
+    hair warm (R 1.00, B 0.97), and a red-beats-blue test on its own would
+    exempt it and punch holes in the whitewash mask.
+
+    Measured on four Abaco reef frames against the old R > 0.85 rule: moderate
+    foam masked went from 3.4% to 10.7% of its area and whitewash from 34% to
+    39%, with 0.6% of the reef flat and none of the turquoise sand masked.
+    Faint glint streaks over deeper water stay largely unmasked by both.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        bright_floor: float = 0.80,
+        contrast_floor: float = 0.65,
+        local_contrast: float = 1.35,
+        max_saturation: float = 0.20,
+        spare_orange: bool = True,
+        orange_margin: float = 0.02,
+        orange_min_saturation: float = 0.12,
+        per_band: bool = False,
+    ) -> None:
+        """Create a new WhitewashAlgorithm.
+
+        Parameters
+        ----------
+        bright_floor
+            Dimmest-channel value (0-1) above which a colourless pixel is
+            masked outright.
+        contrast_floor
+            Dimmest-channel value (0-1) a colourless pixel needs before the
+            local-contrast test applies.
+        local_contrast
+            How many times brighter than its surroundings a pixel between the
+            two floors must be.
+        max_saturation
+            Saturation, (max - min) / max over R, G, B, below which a pixel
+            counts as colourless. Foam reads ~0.02-0.1; reef ~0.2; sand ~0.7.
+        spare_orange
+            Never mask coloured pixels where red beats blue.
+        orange_margin, orange_min_saturation
+            How far red must exceed blue, and how coloured the pixel must be,
+            to count as orange.
+        per_band
+            Repeat the mask for every band, for per-band output.
+
+        """
+        super().__init__()
+        self.bright_floor = bright_floor
+        self.contrast_floor = contrast_floor
+        self.local_contrast = local_contrast
+        self.max_saturation = max_saturation
+        self.spare_orange = spare_orange
+        self.orange_margin = orange_margin
+        self.orange_min_saturation = orange_min_saturation
+        self.per_band = per_band
+
+    def __call__(
+        self,
+        img: np.ndarray,
+        band_scales: np.ndarray | None = None,  # noqa: ARG002
+        saturated: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return the whitewash/glint mask for an (H, W, 3) RGB image scaled to 0-1."""
+        # Drone photos run to 45 MP, and several are processed at once, so work
+        # in place and release full-size float buffers as soon as they're done.
+        dimmest = img.min(axis=2)
+        saturation = img.max(axis=2)
+        saturation -= dimmest
+        saturation /= img.max(axis=2) + EPSILON
+
+        mask = dimmest > self.bright_floor
+        if saturated is not None:
+            # Clipped in every channel is white, whatever the scaling says.
+            mask |= saturated.all(axis=2)
+        background = local_background(dimmest)
+        background *= self.local_contrast
+        mask |= (dimmest > self.contrast_floor) & (dimmest > background)
+        del background, dimmest
+        mask &= saturation < self.max_saturation
+
+        if self.spare_orange:
+            orange = img[:, :, 0] > img[:, :, 2] + self.orange_margin
+            orange &= saturation > self.orange_min_saturation
+            mask &= ~orange
+
+        if self.per_band:
+            return np.repeat(mask[:, :, np.newaxis], img.shape[2], axis=2)
+        return mask
